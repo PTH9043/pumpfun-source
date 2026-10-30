@@ -3,6 +3,7 @@
 import hashlib,json,pathlib,struct
 from capture import b58
 from analyze import elf_layout
+from solders.pubkey import Pubkey
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 # Canonical address of every capture this repository publishes. The gate used to hash the
 # payload and the ProgramData link but never compare `capture.json["program"]` with the
@@ -23,7 +24,20 @@ PROGRAM_ADDRESS={
 # which hid the loss of up to five captures: deleting four of the nine still passed
 # (verified on a sealed copy). Pin the exact set so a removal is a hard failure.
 EXPECTED_CAPTURES=frozenset(PROGRAM_ADDRESS)
+# The upstream IDLs hashed in evidence/upstream/provenance.json. That file also says which
+# files to hash, so deleting an IDL together with its entry passed. Pin the set here too.
+EXPECTED_UPSTREAM=frozenset({'pump.json','pump_amm.json','pump_fees.json'})
 def sha(b): return hashlib.sha256(b).hexdigest()
+UPGRADEABLE_LOADER=Pubkey.from_string('BPFLoaderUpgradeab1e11111111111111111111111')
+# The program account only stores its ProgramData address, and every hash is checked against the
+# capture's own record, so another program's account, ProgramData and payload could be filed under
+# this program id. ProgramData must be the loader PDA of `program`, which ties the bytes to the id.
+def check_programdata_pda(m):
+    derived,_=Pubkey.find_program_address([bytes(Pubkey.from_string(m['program']))],UPGRADEABLE_LOADER)
+    if str(derived)!=m['programdata']:
+        raise AssertionError(f"programdata {m['programdata']} is not the loader PDA of {m['program']} ({derived})")
+
+
 class EvidenceError(Exception): pass
 def check(ok,msg='evidence check failed'):
     # Explicit check instead of `assert`: `python -O` / PYTHONOPTIMIZE strips asserts,
@@ -32,6 +46,10 @@ def check(ok,msg='evidence check failed'):
 def main():
     count=0
     upstream=json.loads((ROOT/'evidence/upstream/provenance.json').read_text())
+    listed=frozenset(upstream['file_sha256'])
+    missing=sorted(EXPECTED_UPSTREAM-listed); unexpected=sorted(listed-EXPECTED_UPSTREAM)
+    assert not missing, f'upstream IDL missing from evidence/upstream/provenance.json: {missing}'
+    assert not unexpected, f'unexpected upstream file in provenance.json (not in EXPECTED_UPSTREAM): {unexpected}'
     for name,expected in upstream['file_sha256'].items():
         check(sha((ROOT/'evidence/upstream'/name).read_bytes())==expected)
     for f in sorted((ROOT/'evidence').glob('**/capture.json')):
@@ -51,6 +69,19 @@ def main():
             check(m.get('last_deploy_slot') is None and m.get('upgrade_authority') is None and not any(k in m for k in ('programdata','programdata_sha256','programdata_bytes')))
             check(elf_layout(b)['trailing_all_zero']); print(folder.relative_to(ROOT),'OK (legacy loader)'); count+=1; continue
         p=(folder/'program-account.bin').read_bytes(); d=(folder/'programdata-account.bin').read_bytes(); b=(folder/'deployed.so').read_bytes()
+        assert sha(p)==m['program_sha256']; assert sha(d)==m['programdata_sha256']; assert sha(b)==m['payload_sha256']
+        assert len(p)==36 and struct.unpack_from('<I',p)[0]==2
+        assert b58(p[4:])==m['programdata']
+        check_programdata_pda(m)
+        assert struct.unpack_from('<I',d)[0]==3
+        assert struct.unpack_from('<Q',d,4)[0]==m['last_deploy_slot']
+        assert (b58(d[13:45]) if d[12] else None)==m['upgrade_authority']
+        assert d[45:]==b and len(b)==m['payload_bytes'] and len(d)==m['programdata_bytes']
+        assert m['genesis_hash']=='5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d'
+        assert m['context_slots']==sorted(m['context_slots']) and m['last_deploy_slot']<=min(m['context_slots'])
+        layout=elf_layout(b); assert layout['trailing_all_zero']
+
+
         check(sha(p)==m['program_sha256']); check(sha(d)==m['programdata_sha256']); check(sha(b)==m['payload_sha256'])
         check(len(p)==36 and struct.unpack_from('<I',p)[0]==2)
         check(b58(p[4:])==m['programdata'])
