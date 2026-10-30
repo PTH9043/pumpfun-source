@@ -22,8 +22,10 @@ def known_instruction_names(name):
     return tuple(sorted(names, key=len, reverse=True))
 
 
-def program_names(root=ROOT):
+def program_names(root=None):
     """Use the archived mapping when present, otherwise the captured programs."""
+    # Resolve ROOT at call time so callers that rebind analyze.ROOT see their own tree.
+    root = ROOT if root is None else root
     path = root / 'repro/programs.json'
     if path.is_file():
         return json.loads(path.read_text())
