@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """Mutation tests ensuring the byte comparator cannot hide code/padding changes."""
-import struct
+import contextlib
+import importlib.util
+import io
+import json
+import pathlib
+import tempfile
 import unittest
+from pathlib import Path
+import compare as compare_module
+import struct
+import sys
+import unittest
+from test_analysis_interface_inventory import InterfaceInventoryEncodingTests
 from types import SimpleNamespace
 import deep_disassembly
 from pathlib import Path
@@ -10,6 +21,7 @@ from unittest.mock import patch
 import deep_section_analysis
 import analyze
 from compare import compare
+from test_pump_diagnostic_audit import DiagnosticMetadataTests
 class ComparisonTests(unittest.TestCase):
     def test_equal(self): self.assertTrue(compare(b'abc\0\0',b'abc\0\0')['full_byte_equality'])
     def test_code_mutation(self): self.assertEqual(compare(b'abc\0\0',b'axc\0\0')['first_difference'],1)
@@ -19,10 +31,18 @@ class ComparisonTests(unittest.TestCase):
     def test_empty(self): self.assertEqual(compare(b'a',b'')['first_difference'],0)
 
 
+class CompareProgramNamesTests(unittest.TestCase):
+    def test_program_names_fall_back_to_captures(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            capture = root / 'evidence/original/probe'
+            capture.mkdir(parents=True)
+            (capture / 'deployed.so').write_bytes(b'ELF')
+            self.assertEqual(compare_module.program_names(root), ['probe'])
+
+
 class RodataStringAddressTests(unittest.TestCase):
     def test_string_keys_use_virtual_address(self):
-class DataLayoutAddressTests(unittest.TestCase):
-    def test_string_address_uses_virtual_address(self):
         blob = bytearray(0x40)
         blob[0x20:0x24] = b'TEST'
         elf = SimpleNamespace(
@@ -32,6 +52,14 @@ class DataLayoutAddressTests(unittest.TestCase):
         strings = deep_disassembly.extract_rodata_strings(elf)
         self.assertEqual(strings[0x1000], 'TEST')
         self.assertNotIn(0x20, strings)
+
+
+class DataLayoutAddressTests(unittest.TestCase):
+    def test_string_address_uses_virtual_address(self):
+        blob = bytearray(0x40)
+        blob[0x20:0x24] = b'TEST'
+        elf = SimpleNamespace(
+            b=bytes(blob),
             lo=0x2000,
             hi=0x3000,
             secs={'.rodata': (0, 1, 2, 0x1000, 0x20, 0x10, 0, 0, 1, 0)},
@@ -178,6 +206,41 @@ class SbpfInventoryInputTests(unittest.TestCase):
                 program_inputs(root)[0][1],
                 root / 'evidence/original/pump/deployed.so',
             )
+
+
+def load_window_scorer():
+    path = pathlib.Path(__file__).resolve().parents[1] / 'reconstruction/harness/score.py'
+    spec = importlib.util.spec_from_file_location('window_score', path)
+    module = importlib.util.module_from_spec(spec)
+    # score.py imports its sibling llvm_tools module.
+    with patch('sys.path', [str(path.parent), *sys.path]):
+        spec.loader.exec_module(module)
+    return module
+
+
+class WindowScorerBaselineTests(unittest.TestCase):
+    def run_main(self, scorer, *args):
+        out = io.StringIO()
+        with patch('sys.argv', ['score.py', 'candidate.so', *args]), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            scorer.main()
+        return json.loads(out.getvalue())
+
+    def test_default_baseline_reports_a_lost_window(self):
+        scorer = load_window_scorer()
+        # Window 0x120 is a normalized match in the committed baseline.
+        lost = {0x120: {'normalized': False, 'raw': False, 'symbols': [], 'bytes': 176}}
+        with patch.object(scorer, 'score', return_value=lost), \
+                patch.object(pathlib.Path, 'read_bytes', return_value=b''):
+            summary = self.run_main(scorer)
+        self.assertEqual(summary['losses'], ['0x120'])
+
+    def test_missing_baseline_is_an_error(self):
+        scorer = load_window_scorer()
+        with patch.object(scorer, 'score', side_effect=AssertionError('scored without a baseline')):
+            with self.assertRaises(SystemExit) as exit_:
+                self.run_main(scorer, '--baseline', 'missing/score.json')
+        self.assertEqual(exit_.exception.code, 2)
 
 
 if __name__=='__main__': unittest.main()
