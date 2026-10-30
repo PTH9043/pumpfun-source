@@ -19,6 +19,10 @@ jobs:
           - suite: contract-tests
             commands: |
               python -B -m unittest discover -s tests -v
+          - suite: fees-exact-source-staging
+            commands: |
+              python -B research/fees-exact-readme-stage-20261030/test_stage.py
+              python -B research/fees-exact-readme-stage-20261030/replay.py --repo . --output work/fees-exact-source-staging
           - suite: analysis-packet-encoding
             commands: |
               python -B research/tooling-analysis-encoding-20261030/test_verify.py

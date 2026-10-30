@@ -1874,6 +1874,51 @@ class WindowScorerBaselineTests(unittest.TestCase):
         self.assertEqual(exit_.exception.code, 2)
 
 
+class UpstreamEvidenceSetTests(unittest.TestCase):
+    """verify_evidence.py must not take the upstream IDL set from the data it checks."""
+
+    def run_gate(self, root):
+        import contextlib
+        import io
+        import verify_evidence
+        with patch.object(verify_evidence, 'ROOT', root), contextlib.redirect_stdout(io.StringIO()):
+            verify_evidence.main()
+
+    def copy_evidence(self, temporary):
+        import shutil
+        import verify_evidence
+        root = Path(temporary)
+        shutil.copytree(verify_evidence.ROOT / 'evidence', root / 'evidence')
+        self.run_gate(root)  # control: the unmodified copy passes
+        return root
+
+    def rewrite_listing(self, root, change):
+        import json
+        provenance = root / 'evidence/upstream/provenance.json'
+        record = json.loads(provenance.read_bytes())
+        change(record['file_sha256'])
+        provenance.write_bytes((json.dumps(record, indent=2) + '\n').encode())
+
+    def test_removed_idl_and_listing_entry_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.copy_evidence(temporary)
+            (root / 'evidence/upstream/pump_fees.json').unlink()
+            self.rewrite_listing(root, lambda files: files.pop('pump_fees.json'))
+            with self.assertRaisesRegex(AssertionError, r"missing .*'pump_fees\.json'"):
+                self.run_gate(root)
+
+    def test_unexpected_listing_entry_is_rejected(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.copy_evidence(temporary)
+            extra = root / 'evidence/upstream/pump_extra.json'
+            extra.write_bytes(b'{}\n')
+            digest = hashlib.sha256(extra.read_bytes()).hexdigest()
+            self.rewrite_listing(root, lambda files: files.update({'pump_extra.json': digest}))
+            with self.assertRaisesRegex(AssertionError, r"unexpected .*'pump_extra\.json'"):
+                self.run_gate(root)
+
+
 class EndianDecodeTests(unittest.TestCase):
     def test_conversion_direction_and_width(self):
         for opcode, direction in ((0xd4, 'le'), (0xdc, 'be')):

@@ -24,6 +24,9 @@ PROGRAM_ADDRESS={
 # which hid the loss of up to five captures: deleting four of the nine still passed
 # (verified on a sealed copy). Pin the exact set so a removal is a hard failure.
 EXPECTED_CAPTURES=frozenset(PROGRAM_ADDRESS)
+# The upstream IDLs hashed in evidence/upstream/provenance.json. That file also says which
+# files to hash, so deleting an IDL together with its entry passed. Pin the set here too.
+EXPECTED_UPSTREAM=frozenset({'pump.json','pump_amm.json','pump_fees.json'})
 def sha(b): return hashlib.sha256(b).hexdigest()
 UPGRADEABLE_LOADER=Pubkey.from_string('BPFLoaderUpgradeab1e11111111111111111111111')
 # The program account only stores its ProgramData address, and every hash is checked against the
@@ -43,6 +46,10 @@ def check(ok,msg='evidence check failed'):
 def main():
     count=0
     upstream=json.loads((ROOT/'evidence/upstream/provenance.json').read_text())
+    listed=frozenset(upstream['file_sha256'])
+    missing=sorted(EXPECTED_UPSTREAM-listed); unexpected=sorted(listed-EXPECTED_UPSTREAM)
+    assert not missing, f'upstream IDL missing from evidence/upstream/provenance.json: {missing}'
+    assert not unexpected, f'unexpected upstream file in provenance.json (not in EXPECTED_UPSTREAM): {unexpected}'
     for name,expected in upstream['file_sha256'].items():
         check(sha((ROOT/'evidence/upstream'/name).read_bytes())==expected)
     for f in sorted((ROOT/'evidence').glob('**/capture.json')):
