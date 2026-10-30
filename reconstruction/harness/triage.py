@@ -54,9 +54,10 @@ def main():
         on = normalize(w['raw'], w['start'], OS)
         best = None
         for (s, nm) in bylen.get(w['bytes'], []):
-            if s not in cache:
-                cache[s] = normalize(body(blob, cs, s, w['bytes']), s, cs)
-            cn = cache[s]
+            cache_key = (s, w['bytes'])
+            if cache_key not in cache:
+                cache[cache_key] = normalize(body(blob, cs, s, w['bytes']), s, cs)
+            cn = cache[cache_key]
             diff = [i for i in range(0, len(on), 8) if on[i:i + 8] != cn[i:i + 8]]
             noncoord = non_coordinate_slots(on, cn, osites)
             key = (len(noncoord), len(diff))
