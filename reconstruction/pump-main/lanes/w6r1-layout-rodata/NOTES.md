@@ -70,5 +70,5 @@ These are code-structure facts for the admin_cto lanes. They will change when th
 Every data offset in matched windows now equals the original's. The 601 data-lddw windows that are still not raw
 fail only because the section bases sit 0x140 higher: `.text` is 0x1b5a10 vs 0x1b58d0. That comes from the
 unmatched windows' size deltas plus the extra 512-B `v2_native_payments::ensure_rent_exempt` unit (see
-w6r1-layout-order), and `.rel.dyn` has two more entries. Once `.text` reaches the original size, the model gives
+w6r1-layout-order), and `.rel.dyn` has two more entries (0x18050 vs 0x18030), which matches admin_cto's two extra vtable lddw (86 vs 84 data lddw). Once `.text` reaches the original size, the model gives
 1019 raw (full original order) with the data as built here.
