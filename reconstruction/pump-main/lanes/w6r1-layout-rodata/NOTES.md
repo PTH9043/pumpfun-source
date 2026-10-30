@@ -1,6 +1,6 @@
 # Lane w6r1-layout-rodata (wave 6, round 1): rodata / data layout for raw
 
-Base: origin/main c2f6d6509 (`programs/pump` identical to 099b0dd: 1027/1035 normalized, 276 raw).
+Base: origin/main c2f6d6509, rebased onto 8289b1712 (both 1027/1035 normalized, 276 raw; the rebased branch was re-scored against a fresh 8289b17 build: zero losses, unstripped 94a9b81f).
 Builds and scratch: `~/.cache/pumpfun-reconstruction/lanes/w6r1-layout-rodata/` (`scripts/trial.sh`
 wraps fastbuild + score + the w3-raw-layout data metrics; `scripts/capture.py` captures
 `-C no-prepopulate-passes` IR, experiment only).
@@ -39,3 +39,36 @@ runtime path changes. `.text` differs from base only in the two lddw operands; `
 | `.data.rel.ro` non-`.text` slot diffs (of 1294) | 6 | **0** |
 | `.rodata` aligned bytes (of 32031) | 31993 | 31993 |
 | model raw, unmatched fixed, full original order, data as built | 1017 | **1019** |
+
+Rule for every lane: do not write `slice.try_into().unwrap()`/`.expect()` (any `Result<_, TryFromSliceError>`
+that needs `Debug`). It brings the TFSE Debug mono item back and swaps the pair again.
+
+## Remaining data differences (all inside the unmatched admin_cto::execute)
+
+`scripts/unmdata.py` compares, for each unmatched window, the multiset of data lddw targets (section, offset)
+against the original. All of them already reference exactly the original's constants, except
+`0x22a10 admin_cto::execute`:
+- `.rodata`: the `creator/admin_cto.rs` path is created after the `No canonical pump pool for this mint; curve only`
+  msg! literal (line 766). Both are first referenced in `admin_cto::execute`. In the pre-opt IR the path is
+  referenced earlier in the text (IR line 593 vs 1186), yet the msg global is created first, because rustc creates
+  constants in RPO codegen order. So in the original's MIR, an `admin_cto.rs` error block comes before the msg block
+  in RPO. `#[inline]` on the nested `validate` (`17497f92`) gives byte-identical output.
+- path Source references: 16 in ours vs 15 in the original. The `.data.rel.ro:0x128` (24-B vtable) has 12 references vs 10.
+
+These are code-structure facts for the admin_cto lanes. They will change when that window matches.
+
+## Attempts
+
+| id | trial | result |
+| --- | --- | --- |
+| `afe4e465` | t01: 7 TFSE unwrap sites -> `unwrap_or_default` | kept: data windows 1021 -> 1023, .data.rel.ro diffs 6 -> 0, 0 losses |
+| `17497f92` | t02: `#[inline]` nested admin_cto `validate` (path vs msg order) | byte-identical, rejected |
+| - | t03: t01 rebased on 8289b17 | 1027/276, 0 losses vs fresh main build |
+
+## Why official raw cannot move from data layout
+
+Every data offset in matched windows now equals the original's. The 601 data-lddw windows that are still not raw
+fail only because the section bases sit 0x140 higher: `.text` is 0x1b5a10 vs 0x1b58d0. That comes from the
+unmatched windows' size deltas plus the extra 512-B `v2_native_payments::ensure_rent_exempt` unit (see
+w6r1-layout-order), and `.rel.dyn` has two more entries. Once `.text` reaches the original size, the model gives
+1019 raw (full original order) with the data as built here.
