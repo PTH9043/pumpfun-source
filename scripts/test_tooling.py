@@ -45,6 +45,12 @@ import shutil
 import sys
 import tempfile
 import unittest
+import copy
+import json
+import pump_validate_all as corpus
+import pump_validate_parallel as parallel
+
+
 from window_elf_reader import Elf
 
 
@@ -138,6 +144,55 @@ import deep_disassembly
 import analyze
 from window_elf_reader import Elf
 from compare import compare
+class CaseComparisonReceiptTests(unittest.TestCase):
+    original = analyze.ROOT / 'evidence/original/pump/deployed.so'
+    candidate = analyze.ROOT / 'evidence/original/mayhem/deployed.so'
+
+    def report(self, row):
+        return json.loads(json.dumps({
+            'original_sha256': corpus.sha(self.original),
+            'candidate_sha256': corpus.sha(self.candidate),
+            'case_count': corpus.EXPECTED_CASES['volume'],
+            'mismatches': [],
+            'cases': [copy.deepcopy(row) for _ in range(corpus.EXPECTED_CASES['volume'])],
+        }))
+
+    def validate(self, report):
+        return parallel.validate_result('volume', report, self.candidate, self.original)
+
+    def test_explicit_case_differences_cannot_hide_behind_empty_summary(self):
+        for field in ('different_fields', 'diff', 'differences', 'mismatched_fields'):
+            with self.subTest(field=field):
+                report = self.report({'original': {}, 'candidate': {}, field: []})
+                report['cases'][0][field] = ['account']
+                with self.assertRaises(AssertionError):
+                    self.validate(report)
+
+    def test_false_case_match_cannot_hide_behind_empty_summary(self):
+        report = self.report({'original': {}, 'candidate': {}, 'match': True})
+        report['cases'][0]['match'] = False
+        with self.assertRaises(AssertionError):
+            self.validate(report)
+
+    def test_missing_paired_outcomes_or_comparison_are_rejected(self):
+        for row in ({'original': {}, 'match': True},
+                    {'original': {}, 'candidate': None, 'diff': []},
+                    {'original': {}, 'candidate': {}},
+                    {'original': {}, 'candidate': {}, 'diff': None},
+                    {'original': {}, 'candidate': {}, 'match': 1}):
+            with self.subTest(row=row), self.assertRaises(AssertionError):
+                self.validate(self.report(row))
+
+    def test_all_published_generic_case_comparison_encodings_still_pass(self):
+        for field in ('different_fields', 'diff', 'differences', 'mismatched_fields', 'match'):
+            with self.subTest(field=field):
+                self.assertEqual(self.validate(self.report({
+                    'original': {}, 'candidate': {}, field: True if field == 'match' else [],
+                })), corpus.EXPECTED_CASES['volume'])
+
+
+
+
 
 
 class MathDensityOrderTests(unittest.TestCase):
@@ -788,7 +843,8 @@ class ParallelCaseCountTests(unittest.TestCase):
             for explicit_count in (True, False):
                 with self.subTest(suite=name, explicit_count=explicit_count):
                     artifact, report = self.report(count)
-                    report['cases'] = [{'case': index} for index in range(count)]
+                    report['cases'] = [{'case': index, 'original': {}, 'candidate': {}, 'match': True}
+                                       for index in range(count)]
                     if not explicit_count:
                         del report['case_count']
                     self.assertEqual(pump_validate_parallel.validate_result(name, report, artifact, artifact), count)
