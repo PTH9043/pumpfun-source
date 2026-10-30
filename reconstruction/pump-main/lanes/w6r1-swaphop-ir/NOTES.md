@@ -43,3 +43,12 @@ moving the 599 block after complete_fill in IR makes the mayhem test fall throug
 the original. The lever is MIR/IR block order (and which blocks exist), not branch polarity.
 The arm-tail results above are this effect: a non-empty arm-end block survives SimplifyCFG and
 becomes the fallthrough the original has.
+
+## Landing reconciliation (on main 2bad4a9, after sibling #2183)
+The merge 8d7fd3c93 kept this lane's spelling and dropped #2183's `fee_config.to_account_info()`
+clone, which the original makes (107/107 calls): 0.75038 but 106/107 calls. Reconciled to the
+union (this lane's arm tails / post_fill tuple / `if last` + #2183's fee_config clone, `reserves`
+binding and scoped whitelist key): 0x5b3b0 ratio 0.72528 (main) -> 0.7332, 18,544 B, calls
+107/107 (same multiset as main and orig); official 1027/276, compare_scores vs main: no losses.
+`if last` alone: orig tests the stack slot [r10-0xa88] written once at entry (0x5b480) before
+raw_output exists (0x2d08); `mhc_transfer_base_out` returns Ok for 0 itself.
