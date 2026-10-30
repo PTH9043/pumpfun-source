@@ -891,7 +891,7 @@ pub fn buy_exact_quote(ctx:Context<SellV3>,spendable_quote_in:u64,min_tokens_out
     require_neq!(available,0,PumpError::BuyNotEnoughSolToCoverFees);
     let fees=v3_trade_fees(a,available)?;
     let curve=&a.bonding_curve;
-    let (tokens,net,protocol_fee,creator_fee,protocol_fee_bps,creator_fee_bps)=if a.global.whitelist_pda==a.user.key(){
+    let (net_fees,tokens,net)=if a.global.whitelist_pda==a.user.key(){
 
 
 
@@ -902,14 +902,14 @@ pub fn buy_exact_quote(ctx:Context<SellV3>,spendable_quote_in:u64,min_tokens_out
 
 
         let tokens=u64::try_from(crate::constant_product::tokens_for_quote(curve,available)?).map_err(|_|error!(PumpError::Truncation))?;
-        (tokens,available,fees.protocol_fee,fees.creator_fee,fees.protocol_fee_bps,fees.creator_fee_bps)
+        (fees,tokens,available)
     }else{
-        let (net,TradeFees{protocol_fee,creator_fee,protocol_fee_bps,creator_fee_bps})=net_quote_for_budget(&curve.creator,fees.protocol_fee_bps,fees.creator_fee_bps,available)?;
+        let (net,net_fees)=net_quote_for_budget(&curve.creator,fees.protocol_fee_bps,fees.creator_fee_bps,available)?;
 
 
 
         let tokens=u64::try_from(crate::constant_product::tokens_for_quote(curve,net)?).map_err(|_|error!(PumpError::Truncation))?;
-        (tokens,net,protocol_fee,creator_fee,protocol_fee_bps,creator_fee_bps)
+        (net_fees,tokens,net)
     };
     let (amount,quote,fees,post,costs)=if tokens>curve.real_token_reserves{
         let can_cross=v3_can_cross(&a.global,curve,&a.user.key());
@@ -973,7 +973,7 @@ pub fn buy_exact_quote(ctx:Context<SellV3>,spendable_quote_in:u64,min_tokens_out
         (amount,quote,curve_fees,post,costs)
     }else{
         let (mut tokens,mut net)=(tokens,net);
-        let mut costs=v3_buy_costs(a.global.buyback_basis_points,curve.is_mayhem_mode as u8,&quote_fee,net,protocol_fee,creator_fee,None)?;
+        let mut costs=v3_buy_costs(a.global.buyback_basis_points,curve.is_mayhem_mode as u8,&quote_fee,net,net_fees.protocol_fee,net_fees.creator_fee,None)?;
         let total=add(costs.0,costs.1)?;
         if total>spendable_quote_in{
             net=net.checked_sub(total-spendable_quote_in).ok_or(PumpError::BuyNotEnoughSolToCoverFees)?;
@@ -995,11 +995,11 @@ pub fn buy_exact_quote(ctx:Context<SellV3>,spendable_quote_in:u64,min_tokens_out
 
 
             tokens=u64::try_from(crate::constant_product::tokens_for_quote(curve,net)?).map_err(|_|error!(PumpError::Truncation))?;
-            costs=v3_buy_costs(a.global.buyback_basis_points,curve.is_mayhem_mode as u8,&quote_fee,net,protocol_fee,creator_fee,None)?;
+            costs=v3_buy_costs(a.global.buyback_basis_points,curve.is_mayhem_mode as u8,&quote_fee,net,net_fees.protocol_fee,net_fees.creator_fee,None)?;
         }
 
         require_gte!(tokens,min_tokens_out,PumpError::BuySlippageBelowMinTokensOut);
-        (tokens,net,TradeFees{protocol_fee,creator_fee,protocol_fee_bps,creator_fee_bps},None,costs)
+        (tokens,net,net_fees,None,costs)
     };
     let (buyback,post_buyback)=v3_execute_buy(a,ctx.bumps.bonding_curve,is_sol,amount,quote,fees.protocol_fee,fees.creator_fee,post.as_ref(),costs.0,costs.1,&quote_fee)?;
     v3_emit_buy(&mut ctx,amount,quote,&fees,buyback,costs.2,"buy_exact_quote_in",&post,post_buyback)
