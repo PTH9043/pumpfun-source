@@ -15,9 +15,10 @@ is rebased on that main and only adds the two edits below.
 | main 099b0dd | 15,584 | 0.80237 | 1027 / 276 | v13 store order |
 | g7 (= main after #2154) | 15,544 | 0.82553 | 1027 / 276 | |
 | d1 = g7 + exhaustive depth match | 15,560 | 0.82400 | 1027 / 276 | orig `jlt tag,3` form, RA worse |
-| **c1b = d1 + explicit `Result` match on `control_account`** | **15,592** | **0.84194** | **1027 / 276, 0 losses** | is_holder_reward=r6, ctx=r7 as orig |
+| c1b = d1 + explicit `Result` match on `control_account` | 15,592 | 0.84194 | 1027 / 276, 0 losses | is_holder_reward=r6, ctx=r7 as orig |
+| **t6 = c1b + depth computed inside `init_curve` from `source`** | **15,592** | **0.84516** | **1027 / 276, 0 losses** | on main f101886 |
 
-unstripped sha256 `cf4338552a3ad645d895b94f847384a102c985dadfc4e67a099147acba7c834f`.
+unstripped sha256 (t6, rebased on main f101886) `f81143e02e0f6da3f2853b53f8af1e46411e6ccf572e6af5b402c0a4088b8ae2`.
 
 ## Mechanisms
 
@@ -41,8 +42,27 @@ unstripped sha256 `cf4338552a3ad645d895b94f847384a102c985dadfc4e67a099147acba7c8
    byte-identical.) A blank `// layout-pad`-style line below is removed to keep every later
    `line!()` immediate unchanged (the first attempt without it lost 6 normalized windows).
 
-Both edits are behaviour-preserving (`?` on `anchor_lang::Result` is `From::from` identity; the depth
+3. **Depth inside the helper (t6).** Passing `source: QuoteSource` to `init_curve` and evaluating the
+   same exhaustive match there (at the top or at the store: byte-identical) shortens the depth live
+   range across the vqr diamond; the select is now formed next to its store and kept in a register
+   (`jlt tag,3; mov r5,r0; ... stxb [curve+0xa0],r5`): 0.84194 -> 0.84516.
+
+All edits are behaviour-preserving (`?` on `anchor_lang::Result` is `From::from` identity; the depth
 match is exhaustive over the same variants).
+
+## IR-oracle findings not yet expressed in source
+
+- `lategep`: creator destination GEP (curve+8) defined in the memcmp block and the creator memcpy after
+  the token_total_supply store reproduces the original store sequence exactly (vqr, ivqr, vtr, rtr, rqr,
+  tts, creator via a separate pointer, mayhem, ...), 0.83718 alone, 0.85046 with block moves. Spelling
+  attempts (`let creator_slot=&mut bonding_curve.creator` early, `*creator_slot=creator` late) are
+  byte-identical to c1b: MIR ReferencePropagation removes the early borrow.
+- `v2`: binding `let global=&a.global` before `quote_control` in validate makes `walk` take the global
+  pointer from the spill slot as in the original and reaches the exact original size (15,576 B), but
+  RA elsewhere drops the ratio to 0.83217.
+- In the original the `walk` block is laid out directly after the control_account test (fall-through
+  on None, Some values hoisted before the Option test); in ours `walk` is placed at the function end.
+  Speculating the Some reserves load in IR alone (0.81077) does not fix the placement.
 
 ## Tools
 
