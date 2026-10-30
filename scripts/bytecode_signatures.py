@@ -113,7 +113,7 @@ def detect_error_patterns(elf, start, end):
     b = elf.b
     patterns = []
     offset = start
-    while offset < end - 24:
+    while offset + 8 <= end:
         opcode = b[offset]
         # Look for: conditional branch + mov immediate + call/exit
         if opcode in (0x15, 0x1d, 0x25, 0x2d, 0x35, 0x3d,
@@ -234,9 +234,10 @@ def detect_serialization_patterns(elf, start, end):
             max_sequential = max(max_sequential, current_run)
             current_run = 0
 
+    max_sequential = max(max_sequential, current_run)
     return {
         "sequential_stores": sequential_stores,
-        "max_store_run": max(max_sequential, current_run),
+        "max_store_run": max_sequential,
         "memcpy_calls": memcpy_count,
         "likely_serialization": max_sequential >= 4 or memcpy_count >= 2,
     }
@@ -254,7 +255,7 @@ def detect_account_validation(elf, start, end):
     discriminator_checks = 0
     owner_checks = 0
 
-    for offset in range(start, end - 16, 8):
+    for offset in range(start, end - 7, 8):
         # Pattern: ldxdw r?, [r? + 0] followed by comparison
         if b[offset] == 0x79:  # ldxdw
             off = struct.unpack_from("<h", b, offset + 2)[0]

@@ -50,10 +50,11 @@ jobs:
               python scripts/test_reconstruction_identity_audit.py
               python scripts/local_validation.py
               git diff --exit-code -- audit/local-validation.json
-          # Packets that pin the digest of a reviewed tool snapshot. They fail by design when
-          # the bound tool changes, until the packet is re-reviewed and re-bound.
+          # Packets that pin the digest of a reviewed tool snapshot or of its output. They fail
+          # by design when the bound tool changes, until the packet is re-reviewed and re-bound.
           - suite: archived-tool-bindings
             commands: |
+              python -B research/tooling-arithmetic-shift-counts-20261030/test_verify.py
               python -B research/tooling-revalidation-manifests-20261030/test_verify.py
               python -B research/tooling-revalidation-invocation-20261030/test_verify.py
               python -B reconstruction/relocation-text-addresses/test_analyze.py

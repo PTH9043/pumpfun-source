@@ -18,6 +18,14 @@ import json
 
 import os
 import struct
+import codecs
+import gzip
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+
+
 import tempfile
 from pathlib import Path
 
@@ -37,6 +45,13 @@ import shutil
 import sys
 import tempfile
 import unittest
+from window_elf_reader import Elf
+
+
+from amm_sell.test_best_version import BestScoreVersionTests
+from amm_sell.test_sell_distance import AlignmentDistanceTests
+
+
 from amm_sell.test_cached_status import CachedAttemptStatusTests
 
 
@@ -121,7 +136,137 @@ from unittest.mock import patch
 import deep_section_analysis
 import deep_disassembly
 import analyze
+from window_elf_reader import Elf
+from compare import compare
+
+
+class MathDensityOrderTests(unittest.TestCase):
+    def analyze(self, windows):
+        data = bytearray()
+        entries = []
+        for opcodes in windows:
+            entries.append(len(data))
+            data.extend(b''.join(struct.pack('<BBhi', opcode, 0, 0, 0) for opcode in opcodes))
+        return deep_section_analysis.analyze_math_patterns(SimpleNamespace(b=bytes(data), entries=entries, hi=len(data), funcs=[]))
+
+    def test_addition_heavy_window_ranks_by_density(self):
+        report = self.analyze([[0x27, 0x37, *([0x07] * 3), *([0x95] * 15)], [0x07] * 5])
+        rows = report['math_intensive_windows']
+        self.assertEqual([row['arithmetic_density'] for row in rows], [1.0, 0.25])
+        self.assertEqual([row['address'] for row in rows], ['0xa0', '0x0'])
+        self.assertEqual(report['total_math_windows'], 2)
+        self.assertEqual(sum(row['additions'] for row in rows), 8)
+
+    def test_equal_density_preserves_entry_order(self):
+        rows = self.analyze([[0x07] * 5, [0x07] * 10])['math_intensive_windows']
+        self.assertEqual([row['address'] for row in rows], ['0x0', '0x28'])
+        self.assertEqual([row['arithmetic_density'] for row in rows], [1.0, 1.0])
+
+    def test_real_captured_math_windows_are_density_ordered(self):
+        for name in ('pump', 'pump_amm', 'pump_fees', 'mayhem'):
+            with self.subTest(program=name):
+                elf = Elf(analyze.ROOT / 'evidence/original' / name / 'deployed.so')
+                rows = deep_section_analysis.analyze_math_patterns(elf)['math_intensive_windows']
+                densities = [row['arithmetic_density'] for row in rows]
+                self.assertEqual(densities, sorted(densities, reverse=True))
+
+
 import deep_disassembly
+from compare import compare
+
+
+class StackAddressOperandTests(unittest.TestCase):
+    def analyze(self, *instructions):
+        raw = b''.join(struct.pack('<BBhi', *instruction) for instruction in instructions)
+        decoded = []
+        for offset in range(0, len(raw), 8):
+            decoded.append(deep_disassembly.decode_instruction(raw, offset, None)[0])
+        return deep_disassembly.analyze_stack_frame(decoded)
+
+    def test_storing_frame_pointer_value_is_not_a_stack_address(self):
+        # stxdw [r1-64], r10: r1 is the address; r10 is only the stored value.
+        result = self.analyze((0x7b, 0xa1, -64, 0))
+        self.assertEqual(result, {'max_stack_depth': 0, 'stack_slots': 0, 'most_accessed_offsets': []})
+
+    def test_frame_pointer_as_both_base_and_value_counts_once(self):
+        result = self.analyze((0x7b, 0xaa, -16, 0))
+        self.assertEqual(result['max_stack_depth'], 16)
+        self.assertEqual(result['most_accessed_offsets'], [{'offset': -16, 'count': 1}])
+
+    def test_load_and_store_address_bases_keep_real_stack_accesses(self):
+        result = self.analyze(
+            (0x79, 0xa2, -24, 0),  # ldxdw r2, [r10-24]
+            (0x7b, 0x2a, -24, 0),  # stxdw [r10-24], r2
+            (0x7a, 0x0a, -8, 5),  # stdw [r10-8], 5
+        )
+        self.assertEqual(result['max_stack_depth'], 24)
+        self.assertEqual(result['stack_slots'], 2)
+        self.assertEqual(result['most_accessed_offsets'], [{'offset': -24, 'count': 2}, {'offset': -8, 'count': 1}])
+
+    def test_nonmemory_frame_pointer_operand_does_not_count(self):
+        self.assertEqual(self.analyze((0xbf, 0xa1, 0, 0))['stack_slots'], 0)
+
+
+import bytecode_signatures
+from window_elf_reader import Elf
+
+
+import check_sbf_backend_diagnostics as backend_diagnostics
+import test_sbf_backend_diagnostics as backend_cases
+from compare import compare
+
+
+class BackendLogSignatureTests(unittest.TestCase):
+    def setUp(self):
+        folder = analyze.ROOT / 'work'
+        folder.mkdir(exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(prefix='backend-bom-', dir=folder)
+        self.path = Path(self.temporary.name) / 'build.log'
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def test_bom_errors_reject_in_plain_gzip_and_ansi_logs(self):
+        for compressed in (False, True):
+            for colored in (False, True):
+                with self.subTest(compressed=compressed, colored=colored):
+                    line = ('\x1b[31m' if colored else '') + backend_cases.ERROR + ('\x1b[0m' if colored else '')
+                    decoded = codecs.BOM_UTF8 + (line + '\nCargo exit: 0\nstrip exit: 0\n').encode('utf-8')
+                    raw = gzip.compress(decoded, mtime=0) if compressed else decoded
+                    self.path.write_bytes(raw)
+                    result = backend_diagnostics.check([self.path])
+                    self.assertFalse(result['diagnostic_gate_passed'])
+                    self.assertEqual(result['backend_error_count'], 1)
+                    record = result['logs'][0]
+                    self.assertEqual(record['backend_errors'][0]['kind'], 'stack_offset_exceeded')
+                    self.assertEqual(record['backend_errors'][0]['line_number'], 1)
+                    self.assertEqual(record['input_sha256'], hashlib.sha256(raw).hexdigest())
+                    self.assertEqual(record['decoded_sha256'], hashlib.sha256(decoded).hexdigest())
+                    self.assertEqual(self.path.read_bytes(), raw)
+
+    def test_clean_bom_log_still_makes_no_readiness_claim(self):
+        self.path.write_bytes(codecs.BOM_UTF8 + b'Finished release\n')
+        result = backend_diagnostics.check([self.path])
+        self.assertTrue(result['diagnostic_gate_passed'])
+        self.assertFalse(result['program_readiness_proven'])
+
+    def test_only_the_initial_signature_is_removed(self):
+        self.path.write_bytes(codecs.BOM_UTF8 + 'Error: internal \ufeff payload\n'.encode('utf-8'))
+        errors = backend_diagnostics.inspect(self.path)['backend_errors']
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]['text'], 'Error: internal \ufeff payload')
+
+    def test_actual_cli_rejects_a_bom_prefixed_error(self):
+        self.path.write_bytes(codecs.BOM_UTF8 + (backend_cases.ERROR + '\n').encode('utf-8'))
+        result = subprocess.run([sys.executable, backend_diagnostics.__file__, '--log', str(self.path)], capture_output=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse(json.loads(result.stdout)['diagnostic_gate_passed'])
+
+
+import deep_disassembly
+from window_elf_reader import Elf
+
+
 import bytecode_signatures
 from compare import compare
 
@@ -194,6 +339,54 @@ import analyze_program
 import deep_disassembly
 from window_elf_reader import Elf
 from compare import compare
+class InferredStructExtentTests(unittest.TestCase):
+    def analyze_offsets(self, offsets):
+        code = b''.join(struct.pack('<BBhi', 0x79, 0x21, offset, 0) for offset in offsets)
+        header = bytearray(64)
+        struct.pack_into('<Q', header, 24, 64)
+        elf = SimpleNamespace(b=bytes(header) + code, lo=64, hi=64+len(code),
+                              entries=[64], funcs=[], secs={})
+        return deep_section_analysis.recover_anchor_idl(elf)
+
+    def test_size_inference_is_not_limited_to_twenty_displayed_fields(self):
+        for count in (20, 21, 35):
+            with self.subTest(count=count):
+                result = self.analyze_offsets(list(range(0, count*8, 8)))
+                row = result['deserialization_patterns'][0]
+                self.assertEqual(row['field_offsets'], list(range(0, min(count, 20)*8, 8)))
+                self.assertEqual(row['field_sizes'], [8]*min(count, 20))
+                self.assertEqual(row['likely_struct_size'], count*8)
+                self.assertEqual(result['inferred_struct_sizes'], [count*8])
+
+    def test_duplicate_reads_do_not_change_the_observed_extent(self):
+        offsets = list(range(0, 21*8, 8))
+        result = self.analyze_offsets(offsets + offsets[-5:])
+        self.assertEqual(result['deserialization_patterns'][0]['likely_struct_size'], 168)
+        self.assertEqual(len(result['deserialization_patterns'][0]['field_offsets']), 20)
+
+    def test_retained_patterns_use_the_full_observed_load_extent(self):
+        checked = capped = 0
+        for path in sorted(analyze.ROOT.glob('evidence/**/deployed.so')):
+            elf = Elf(path)
+            ends = dict(zip(elf.entries, elf.entries[1:] + [elf.hi]))
+            result = deep_section_analysis.recover_anchor_idl(elf)
+            for row in result['deserialization_patterns']:
+                start = int(row['window'], 16)
+                offsets = {struct.unpack_from('<h', elf.b, at+2)[0]
+                           for at in range(start, ends[start], 8)
+                           if elf.b[at] in (0x61, 0x69, 0x71, 0x79)
+                           and elf.b[at+1] >> 4 == row['base_reg']}
+                self.assertEqual(row['likely_struct_size'], max(offsets)+8,
+                                 f'{path.parent.name}:{start:#x}:r{row["base_reg"]}')
+                self.assertLessEqual(len(row['field_offsets']), 20)
+                checked += 1
+                capped += len(offsets) > 20
+        self.assertGreater(checked, 0)
+        self.assertGreater(capped, 0)
+
+
+
+
 import verify_evidence
 
 
@@ -703,6 +896,104 @@ class ComparisonTests(unittest.TestCase):
     def test_truncated_padding(self): self.assertFalse(compare(b'abc\0\0',b'abc\0')['full_byte_equality'])
     def test_extended_padding(self): self.assertFalse(compare(b'abc\0',b'abc\0\0')['full_byte_equality'])
     def test_empty(self): self.assertEqual(compare(b'a',b'')['first_difference'],0)
+
+
+class SerializationBoundaryTests(unittest.TestCase):
+    def detect(self, opcodes):
+        raw = b''.join(struct.pack('<BBhi', opcode, 0, 0, 0) for opcode in opcodes)
+        return bytecode_signatures.detect_serialization_patterns(SimpleNamespace(b=raw), 0, len(raw))
+
+    def test_terminal_store_run_meets_the_existing_threshold(self):
+        result = self.detect([0x63, 0x6b, 0x73, 0x7b])
+        self.assertEqual(result['sequential_stores'], 4)
+        self.assertEqual(result['max_store_run'], 4)
+        self.assertTrue(result['likely_serialization'])
+
+    def test_short_and_interrupted_runs_do_not_meet_threshold(self):
+        for opcodes in ([0x63] * 3, [0x63, 0x63, 0xb7, 0x63, 0x63], []):
+            with self.subTest(opcodes=opcodes):
+                self.assertFalse(self.detect(opcodes)['likely_serialization'])
+
+    def test_classification_does_not_depend_on_a_trailing_exit(self):
+        for opcodes in ([0x63] * 4, [0x63] * 5, [0x63] * 2 + [0xb7] + [0x63] * 4):
+            with self.subTest(opcodes=opcodes):
+                self.assertEqual(self.detect(opcodes), self.detect([*opcodes, 0x95]))
+
+    def test_retained_four_store_ranges(self):
+        ranges = {'pump': 0x1788, 'pump_amm': 0xe50, 'pump_fees': 0x1bf0, 'mayhem': 0x5720}
+        for name, start in ranges.items():
+            with self.subTest(program=name):
+                elf = Elf(analyze.ROOT / 'evidence/original' / name / 'deployed.so')
+                self.assertTrue(all(elf.b[at] in (0x63, 0x6b, 0x73, 0x7b) for at in range(start, start + 32, 8)))
+                result = bytecode_signatures.detect_serialization_patterns(elf, start, start + 32)
+                self.assertEqual(result['max_store_run'], 4)
+                self.assertTrue(result['likely_serialization'])
+
+
+class PatternTailScanTests(unittest.TestCase):
+    def test_error_branch_in_last_instruction_is_scanned(self):
+        raw = struct.pack('<BBhi', 0xb7, 0, 0, 6000) + struct.pack('<BBhi', 0x15, 0, -2, 0)
+        result = bytecode_signatures.detect_error_patterns(SimpleNamespace(b=raw), 0, len(raw))
+        self.assertEqual(result, [{'offset': 8, 'branch_target_offset': 0, 'error_code': 6000, 'type': 'conditional_error'}])
+
+    def test_account_pair_uses_only_its_two_instruction_extent(self):
+        raw = struct.pack('<BBhi', 0x79, 1, 0, 0) + struct.pack('<BBhi', 0x55, 1, 0, 8)
+        result = bytecode_signatures.detect_account_validation(SimpleNamespace(b=raw), 0, len(raw))
+        self.assertEqual(result['discriminator_checks'], 1)
+        self.assertTrue(result['likely_account_validation'])
+
+    def test_single_owner_field_load_is_included(self):
+        raw = struct.pack('<BBhi', 0x79, 1, 32, 0)
+        result = bytecode_signatures.detect_account_validation(SimpleNamespace(b=raw), 0, len(raw))
+        self.assertEqual(result['owner_field_accesses'], 1)
+        self.assertFalse(result['likely_account_validation'])
+
+    def test_empty_ranges_are_empty(self):
+        elf = SimpleNamespace(b=b'')
+        self.assertEqual(bytecode_signatures.detect_error_patterns(elf, 0, 0), [])
+        self.assertEqual(bytecode_signatures.detect_account_validation(elf, 0, 0)['owner_field_accesses'], 0)
+
+    def test_retained_pump_terminal_branch(self):
+        elf = Elf(analyze.ROOT / 'evidence/original/pump/deployed.so')
+        result = bytecode_signatures.detect_error_patterns(elf, 0xef40, 0xefc8)
+        self.assertIn({'offset': 120, 'branch_target_offset': 24, 'error_code': 0, 'type': 'conditional_error'}, result)
+
+
+class NegationDecodeTests(unittest.TestCase):
+    def test_negation_has_only_a_destination_operand(self):
+        for opcode, mnemonic in ((0x84, 'neg32'), (0x87, 'neg64')):
+            for register in (0, 3, 10):
+                with self.subTest(opcode=opcode, register=register):
+                    raw = struct.pack('<BBhi', opcode, register, 0, 0)
+                    result, size = deep_disassembly.decode_instruction(raw, 0, None)
+                    self.assertEqual(result['mnemonic'], f'{mnemonic} r{register}')
+                    self.assertEqual(result['hex'], raw.hex())
+                    self.assertEqual(result['imm'], 0)
+                    self.assertEqual(size, 8)
+
+    def test_binary_alu_operands_are_unchanged(self):
+        for raw, expected in (
+            (struct.pack('<BBhi', 0x07, 3, 0, -2), 'add64 r3, -2'),
+            (struct.pack('<BBhi', 0x0f, 0x23, 0, 0), 'add64 r3, r2'),
+            (struct.pack('<BBhi', 0x17, 3, 0, 0), 'sub64 r3, 0'),
+        ):
+            self.assertEqual(deep_disassembly.decode_instruction(raw, 0, None)[0]['mnemonic'], expected)
+
+    def test_captured_negations_have_no_invented_immediate(self):
+        expected_counts = {'pump': 25, 'pump_amm': 24, 'pump_fees': 16, 'mayhem': 30}
+        for name, expected_count in expected_counts.items():
+            elf = Elf(analyze.ROOT / 'evidence/original' / name / 'deployed.so')
+            count = 0
+            offset = elf.lo
+            while offset < elf.hi:
+                opcode = elf.b[offset]
+                if opcode in (0x84, 0x87):
+                    result, size = deep_disassembly.decode_instruction(elf.b, offset, elf)
+                    self.assertEqual(result['mnemonic'], f"neg{32 if opcode == 0x84 else 64} r{elf.b[offset + 1] & 15}")
+                    self.assertEqual(size, 8)
+                    count += 1
+                offset += 16 if opcode == 0x18 else 8
+            self.assertEqual(count, expected_count, name)
 
 
 class EvidenceCheckOptimizeTests(unittest.TestCase):
@@ -1525,6 +1816,93 @@ class WindowScorerBaselineTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as exit_:
                 self.run_main(scorer, '--baseline', 'missing/score.json')
         self.assertEqual(exit_.exception.code, 2)
+
+
+class EndianDecodeTests(unittest.TestCase):
+    def test_conversion_direction_and_width(self):
+        for opcode, direction in ((0xd4, 'le'), (0xdc, 'be')):
+            for width in (16, 32, 64):
+                with self.subTest(direction=direction, width=width):
+                    blob = struct.pack('<BBhi', opcode, 5, 0, width)
+                    record, size = deep_disassembly.decode_instruction(blob, 0, None)
+                    self.assertEqual(record['mnemonic'], f'{direction}{width} r5')
+                    self.assertEqual(record['imm'], width)
+                    self.assertEqual(record['hex'], blob.hex())
+                    self.assertEqual(size, 8)
+
+    def test_other_alu_operand_forms_are_unchanged(self):
+        for opcode, regs, immediate, mnemonic in (
+            (0x04, 5, 16, 'add32 r5, 16'),
+            (0x0c, 0x35, 0, 'add32 r5, r3'),
+        ):
+            with self.subTest(opcode=opcode):
+                blob = struct.pack('<BBhi', opcode, regs, 0, immediate)
+                record, _ = deep_disassembly.decode_instruction(blob, 0, None)
+                self.assertEqual(record['mnemonic'], mnemonic)
+
+    def test_captured_big_endian_conversions(self):
+        for relative in ('original/mayhem', 'dependencies/spl_token_2022'):
+            with self.subTest(capture=relative):
+                elf = deep_disassembly.Elf(
+                    analyze.ROOT / 'evidence' / relative / 'deployed.so')
+                offset = elf.lo
+                widths = []
+                while offset < elf.hi:
+                    record, size = deep_disassembly.decode_instruction(elf.b, offset, elf)
+                    if elf.b[offset] == 0xdc:
+                        widths.append(record['imm'])
+                        self.assertEqual(record['mnemonic'],
+                                         f"be{record['imm']} r{record['dst']}")
+                    offset += size
+                self.assertEqual(sorted(widths), [16] + [32] * 7)
+
+
+class MemoryWidthDecodeTests(unittest.TestCase):
+    # Explicit instruction spellings from SBPF's LD/ST/STX definitions,
+    # including word operations whose spelling was already correct.
+    FORMS = {
+        0x61: 'ldxw', 0x69: 'ldxh', 0x71: 'ldxb', 0x79: 'ldxdw',
+        0x62: 'stw', 0x6a: 'sth', 0x72: 'stb', 0x7a: 'stdw',
+        0x63: 'stxw', 0x6b: 'stxh', 0x73: 'stxb', 0x7b: 'stxdw',
+    }
+
+    def test_all_load_and_store_widths_preserve_operands(self):
+        for opcode, operation in self.FORMS.items():
+            with self.subTest(opcode=hex(opcode)):
+                cls = opcode & 7
+                regs = 5 if cls == 2 else 0x35
+                blob = struct.pack('<BBhi', opcode, regs, -16, 7)
+                record, size = deep_disassembly.decode_instruction(blob, 0, None)
+                if cls == 1:
+                    expected = f'{operation} r5, [r3-16]'
+                elif cls == 2:
+                    expected = f'{operation} [r5-16], 7'
+                else:
+                    expected = f'{operation} [r5-16], r3'
+                self.assertEqual(record['mnemonic'], expected)
+                self.assertTrue(record['memory_access'])
+                self.assertEqual((record['dst'], record['src'], record['off'], record['imm']),
+                                 (5, regs >> 4, -16, 7))
+                self.assertEqual(record['hex'], blob.hex())
+                self.assertEqual(size, 8)
+
+    def test_memory_widths_in_all_four_captured_programs(self):
+        for name in ('pump', 'pump_amm', 'pump_fees', 'mayhem'):
+            with self.subTest(program=name):
+                elf = deep_disassembly.Elf(
+                    analyze.ROOT / 'evidence/original' / name / 'deployed.so')
+                offset = elf.lo
+                seen = set()
+                mismatches = 0
+                while offset < elf.hi:
+                    record, size = deep_disassembly.decode_instruction(elf.b, offset, elf)
+                    opcode = elf.b[offset]
+                    if opcode in self.FORMS:
+                        seen.add(opcode)
+                        mismatches += record['mnemonic'].split()[0] != self.FORMS[opcode]
+                    offset += size
+                self.assertEqual(seen, set(self.FORMS))
+                self.assertEqual(mismatches, 0)
 
 
 if __name__=='__main__': unittest.main()

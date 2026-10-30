@@ -479,7 +479,8 @@ def recover_anchor_idl(elf):
                                           if ld["mem_offset"] == o), 0)
                                     for o in offsets[:20]
                                 ],
-                                "likely_struct_size": max(offsets[:20]) + 8 if offsets else 0,
+                                # Infer before the display-only cap on field details.
+                                "likely_struct_size": max(offsets) + 8 if offsets else 0,
                             })
 
     # Deduplicate account sizes
@@ -565,7 +566,7 @@ def analyze_math_patterns(elf):
             elif opcode in (0x17, 0x1f):  # sub64
                 sub_count += 1
                 prev_op = "sub"
-            elif opcode in (0x67, 0x6f, 0x77, 0x7f):  # shifts
+            elif opcode in (0x67, 0x6f, 0x77, 0x7f, 0xc7, 0xcf):  # 64-bit shifts
                 shift_count += 1
                 prev_op = "shift"
             else:
@@ -611,7 +612,7 @@ def analyze_math_patterns(elf):
             })
 
     # Sort by arithmetic density
-    math_windows.sort(key=lambda w: -(w["multiplications"] + w["divisions"]))
+    math_windows.sort(key=lambda w: -w["arithmetic_density"])
 
     return {
         "math_intensive_windows": math_windows,
