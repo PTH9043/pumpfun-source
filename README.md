@@ -5,6 +5,12 @@ on-chain Solana programs — Pump Main, PumpSwap/AMM, Fees, Mayhem and the
 Donation Relay. Each program is rebuilt from source with a pinned toolchain
 and scored instruction-by-instruction against the captured deployed binary.
 
+**Scope.** Only the program bytecode publicly deployed on-chain is
+reconstructed. This project does not reconstruct, capture or reproduce
+pump.fun's website, apps, backend services, APIs, SDKs, branding or any other
+off-chain material. Pull requests for frontend, backend, SDK or off-chain
+capture work are closed without review. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 Everything here serves building, scoring, verifying or differential-testing
 those programs. There is no frontend, backend, SDK or off-chain service code.
 
@@ -24,7 +30,7 @@ those programs. There is no frontend, backend, SDK or off-chain service code.
 | [PumpSwap / AMM](programs/pump-amm/README.md) |785/785|100.0%|785|0|0|**Yes**|
 | [Fees](programs/pump-fees/README.md) |585/585|100.0%|585|0|0|**Yes**|
 | [Mayhem](programs/mayhem/README.md) |441/441|100.0%|441|0|0|**Yes**|
-| [Donation Relay](repro/donation-relay/canonical-exact-selection/README.md) |492/492|100.0%|492|0|0|**Yes**|
+| [Donation Relay](programs/donation-relay/) |492/492|100.0%|492|0|0|**Yes**|
 | **Total** |**3,323/3,338**|**99.6%**|**2,491**|**832**|**15**|**4/5**|
 
 Matched windows cover **5,045,232/5,213,128 code bytes (96.8%)**.

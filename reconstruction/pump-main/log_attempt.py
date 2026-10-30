@@ -92,8 +92,12 @@ def matches(row, args):
     if getattr(args, 'status', None) and row.get('status') != args.status:
         return False
     if getattr(args, 'text', None):
-        blob = json.dumps(row).lower()
-        return all(word.lower() in blob for word in args.text.split())
+        blob = json.dumps(row, ensure_ascii=False).lower()
+        # Preserve serialized-metadata queries and also match literal text
+        # inside JSON strings (quotes and backslashes are escaped there).
+        return all(word.lower() in blob or
+                   json.dumps(word.lower(), ensure_ascii=False)[1:-1] in blob
+                   for word in args.text.split())
     return True
 
 
@@ -132,11 +136,13 @@ def main():
     if args.command == 'search':
         def run(rows):
             hits = [r for r in rows if matches(r, args)]
-            for r in hits[-args.limit:]:
+            # hits[-0:] is the whole list, so an explicit zero must be handled.
+            shown = hits[-args.limit:] if args.limit else []
+            for r in shown:
                 data = r.get('data') or {}
                 note = data.get('result') or data.get('notes') or data.get('outcome') or ''
                 print(json.dumps({k: r.get(k) for k in ['timestamp_utc', 'lane', 'target', 'status', 'dedupe_key', 'hypothesis']} | {'note': str(note)[:300]}))
-            print(f'# {len(hits)} matching rows ({min(len(hits), args.limit)} shown, newest last)')
+            print(f'# {len(hits)} matching rows ({len(shown)} shown, newest last)')
         return locked(run)
 
     if args.command == 'summary':

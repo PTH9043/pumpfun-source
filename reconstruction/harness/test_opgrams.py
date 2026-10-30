@@ -1,3 +1,5 @@
+# Regression cases retained from crypto-projects-x/pumpfun-source PR #1316
+# (c845bc248e2a251768c38372c5dcfc65af36a59e); implementation lives in instruction_stream.py.
 #!/usr/bin/env python3
 """Opcode n-grams follow the same instruction width as insns()."""
 import importlib.util

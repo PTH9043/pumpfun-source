@@ -17,6 +17,7 @@ from llvm_tools import objdump
 H = Path(__file__).resolve().parent
 sys.path.insert(0, str(H))
 from score import sections, normalize, body, candidate_functions, original_windows, score, BASE  # noqa
+from instruction_stream import instruction_offsets
 
 
 
@@ -69,9 +70,7 @@ class Cand:
 
 
 def opgrams(raw, k=3):
-    ops = []; i = 0
-    while i < len(raw):
-        ops.append(raw[i]); i += 16 if raw[i] == 0x18 else 8
+    ops = [raw[i] for i in instruction_offsets(raw)]
     return Counter(tuple(ops[i:i + k]) for i in range(max(0, len(ops) - k + 1)))
 
 
@@ -112,9 +111,20 @@ def cmd_list(a):
         print(f"{st:#08x} {b:6d}B  best={r:.3f} cand@{s:#x} {n:6d}B  {name}")
 
 
+def find_window(text):
+    """Return (start, window) for an original window start, or exit 2 with a message."""
+    try:
+        st = int(text, 0)
+    except ValueError:
+        print(f'win.py: error: {text!r} is not a numeric address (e.g. 0x14f4e0)', file=sys.stderr); sys.exit(2)
+    w = next((x for x in original_windows() if x['start'] == st), None)
+    if w is None:
+        print(f'win.py: error: {st:#x} is not an original window start (see `win.py list --all`)', file=sys.stderr); sys.exit(2)
+    return st, w
+
+
 def cmd_show(a):
-    st = int(a.start, 0)
-    w = next(x for x in original_windows() if x['start'] == st)
+    st, w = find_window(a.start)
     cand = Cand(a.cand)
     if a.sym:
         cs = [(s, n, nm) for (s, n, nm) in cand.funcs if re.search(a.sym, nm) or re.search(a.sym, demangle(nm))]
@@ -154,8 +164,7 @@ def cmd_show(a):
 
 
 def cmd_orig(a):
-    st = int(a.start, 0)
-    w = next(x for x in original_windows() if x['start'] == st)
+    st, w = find_window(a.start)
     for ad, t in objdump_text(BASE / 'original.so', st, st + w['bytes']).items():
         print(f"{ad:#07x}  {t}")
 

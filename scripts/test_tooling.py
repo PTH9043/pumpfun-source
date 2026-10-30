@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """Mutation tests ensuring the byte comparator cannot hide code/padding changes."""
+import json
+import pathlib
+import struct
+
+
 import contextlib
 import importlib.util
 import io
@@ -7,6 +12,15 @@ import json
 import pathlib
 import tempfile
 import unittest
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
 from pathlib import Path
 import compare as compare_module
 import struct
@@ -19,8 +33,73 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 import deep_section_analysis
+import deep_disassembly
 import analyze
+import local_validation
 from compare import compare
+
+
+class RevalidationReportTests(unittest.TestCase):
+    def test_real_audit_requires_every_available_packet_check(self):
+        repo = Path(__file__).resolve().parents[1]
+        source = (repo / 'evidence/upstream/pump.json').read_bytes()
+        address = json.loads(source)['address']
+        with tempfile.TemporaryDirectory(prefix='pump-revalidation-') as temporary:
+            root = Path(temporary).resolve()
+            self.assertTrue(root.name.startswith('pump-revalidation-'))
+            (root / 'scripts').mkdir()
+            shutil.copyfile(repo / 'scripts/revalidate_all.py', root / 'scripts/revalidate_all.py')
+            for name in ['both-pass', 'manifest-fails', 'verifier-fails',
+                         'manifest-parse-error', 'manifest-only', 'verifier-only', 'neither']:
+                packet = root / 'research' / name
+                packet.mkdir(parents=True)
+                (packet / 'pump.json').write_bytes(source)
+                (packet / 'notes.txt').write_text('recorded notes', encoding='utf-8')
+                if name not in ['verifier-only', 'neither']:
+                    manifest = {file: hashlib.sha256((packet / file).read_bytes()).hexdigest()
+                                for file in ['pump.json', 'notes.txt']}
+                    (packet / 'manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
+                if name not in ['manifest-only', 'neither']:
+                    # Independently check the real retained IDL's program address.
+                    (packet / 'verify.py').write_text(
+                        'import json\nfrom pathlib import Path\n'
+                        'data = json.loads(Path("pump.json").read_text(encoding="utf-8"))\n'
+                        f'raise SystemExit(0 if data["address"] == {address!r} else 3)\n',
+                        encoding='utf-8')
+                if name == 'manifest-fails':
+                    (packet / 'notes.txt').write_text('changed notes', encoding='utf-8')
+                if name == 'verifier-fails':
+                    data = json.loads(source)
+                    data['address'] = 'different program'
+                    (packet / 'pump.json').write_text(json.dumps(data), encoding='utf-8')
+                    manifest['pump.json'] = hashlib.sha256((packet / 'pump.json').read_bytes()).hexdigest()
+                    (packet / 'manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
+                if name == 'manifest-parse-error':
+                    (packet / 'manifest.json').write_text('{', encoding='utf-8')
+            output = root / 'audit'
+            result = subprocess.run([sys.executable, '-B', str(root / 'scripts/revalidate_all.py'),
+                                     '--output', str(output)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            rows = {row['packet']: row for row in json.loads((output / 'results.json').read_text(encoding='utf-8'))}
+            self.assertEqual(rows['manifest-fails']['manifest_check']['status'], 'fail')
+            self.assertEqual(rows['manifest-fails']['verify_check']['status'], 'pass')
+            self.assertEqual(rows['verifier-fails']['manifest_check']['status'], 'pass')
+            self.assertEqual(rows['verifier-fails']['verify_check']['status'], 'fail')
+            for name in ['manifest-fails', 'verifier-fails', 'manifest-parse-error']:
+                self.assertEqual(rows[name]['overall'], 'fail', name)
+            for name in ['both-pass', 'manifest-only', 'verifier-only']:
+                self.assertEqual(rows[name]['overall'], 'pass', name)
+            self.assertEqual(rows['neither']['overall'], 'no_verification')
+            summary = json.loads((output / 'summary.json').read_text(encoding='utf-8'))
+            self.assertEqual((summary['pass'], summary['fail'], summary['skip_or_inconclusive']), (3, 3, 1))
+            self.assertEqual(set(json.loads((output / 'failed.json').read_text(encoding='utf-8'))),
+                             {'manifest-fails', 'verifier-fails', 'manifest-parse-error'})
+            # The generated audit's own integrity verifier still succeeds.
+            verified = subprocess.run([sys.executable, '-B', str(output / 'verify.py')],
+                                      capture_output=True, text=True)
+            self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
+
+
 from test_pump_diagnostic_audit import DiagnosticMetadataTests
 class ComparisonTests(unittest.TestCase):
     def test_equal(self): self.assertTrue(compare(b'abc\0\0',b'abc\0\0')['full_byte_equality'])
@@ -108,7 +187,83 @@ class RelocationTargetTests(unittest.TestCase):
         self.assertEqual(report['entries'][0]['target_section'], '.rodata')
 
 
+class ControlFlowJumpTests(unittest.TestCase):
+    def edges(self, opcode, branch_offset=0):
+        blob = bytes(16) + struct.pack('<BBhi', opcode, 0, branch_offset, 0)
+        insn, _ = deep_disassembly.decode_instruction(blob, 16, SimpleNamespace())
+        return deep_disassembly.build_cfg_edges([insn], 0, len(blob))
+
+    def test_unconditional_forward_and_backward_jumps_have_one_edge(self):
+        for branch_offset in (0, 2, -2):
+            with self.subTest(branch_offset=branch_offset):
+                self.assertEqual(self.edges(0x05, branch_offset), [{
+                    'from': '0x10', 'to': hex(24 + branch_offset * 8),
+                    'type': 'branch', 'conditional': False,
+                }])
+
+    def test_conditional_jumps_keep_both_edges(self):
+        for opcode in (0x15, 0x1d, 0x55, 0x5d):
+            with self.subTest(opcode=hex(opcode)):
+                self.assertEqual(self.edges(opcode, -2), [
+                    {'from': '0x10', 'to': '0x8', 'type': 'branch', 'conditional': True},
+                    {'from': '0x10', 'to': '0x18', 'type': 'fallthrough', 'conditional': False},
+                ])
+
+    def test_exit_and_non_branch_behavior_is_unchanged(self):
+        self.assertEqual(self.edges(0x95), [{
+            'from': '0x10', 'to': 'return', 'type': 'exit', 'conditional': False,
+        }])
+        self.assertEqual(self.edges(0xb7), [])
+
+    def test_captured_unconditional_jumps_have_no_fallthrough(self):
+        for name in ('pump', 'pump_amm', 'pump_fees', 'mayhem'):
+            with self.subTest(program=name):
+                elf = deep_disassembly.Elf(
+                    analyze.ROOT / 'evidence/original' / name / 'deployed.so')
+                offset = elf.lo
+                jumps = invalid = 0
+                while offset < elf.hi:
+                    instruction, size = deep_disassembly.decode_instruction(elf.b, offset, elf)
+                    if elf.b[offset] == 0x05:
+                        jumps += 1
+                        edges = deep_disassembly.build_cfg_edges([instruction], elf.lo, elf.hi)
+                        expected = [{
+                            'from': hex(offset), 'to': hex(instruction['branch_target']),
+                            'type': 'branch', 'conditional': False,
+                        }]
+                        invalid += edges != expected
+                    offset += size
+                self.assertGreater(jumps, 0)
+                self.assertEqual(invalid, 0)
+
+
 class InstructionLogNameTests(unittest.TestCase):
+    def test_scan_does_not_copy_binary_suffixes(self):
+        class UnslicedBytes(bytes):
+            def __getitem__(self, key):
+                if isinstance(key, slice):
+                    raise AssertionError('instruction scan copied binary bytes')
+                return super().__getitem__(key)
+
+        blob = UnslicedBytes(
+            b'Instruction: Buyadjacent\0Instruction: Unknown42\0' + bytes(1024 * 1024)
+        )
+        self.assertEqual(analyze.instruction_log_names(blob, ('Buy',)), ['Buy', 'Unknown42'])
+
+    def test_scan_preserves_marker_boundaries_and_fallback(self):
+        blob = (b'Instruction: BuyV2adjacent\0Instruction: Buytail\0'
+                b'Instruction: Unknown42Instruction\0Instruction: Instruction\0'
+                b'Instruction: lowercaseLater\0Instruction: \xffBad\0'
+                b'Instruction: Unknown42\0Instruction: End9')
+        self.assertEqual(
+            analyze.instruction_log_names(blob, ('BuyV2', 'Buy')),
+            ['Buy', 'BuyV2', 'End9', 'Instruction', 'Unknown42'],
+        )
+        self.assertEqual(analyze.instruction_log_names(b'Instruction: '), [])
+        self.assertEqual(analyze.instruction_log_names(b'no marker'), [])
+        self.assertEqual(analyze.instruction_log_names(b''), [])
+
+
     def test_idl_names_are_independent_of_locale_encoding(self):
         original_open = Path.open
         for program in ('pump', 'pump_amm', 'pump_fees'):
@@ -175,6 +330,87 @@ class InstructionLogNameTests(unittest.TestCase):
         self.assertEqual(len(names), 25)
         self.assertIn('Buy', names)
         self.assertIn('InitializeGlobalParams', names)
+
+
+# capture.json program ids. pump, pump_amm and pump_fees also match their IDL
+# address; mayhem has a receipt and no IDL.
+_CAPTURED_PROGRAMS = {
+    'pump': '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
+    'pump_amm': 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',
+    'pump_fees': 'pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ',
+    'mayhem': 'MAyhSmzXzV1pTf7LsNkrNwkWKTo4ougAJ1PPg47MD4e',
+}
+
+
+class LocalValidationProgramTests(unittest.TestCase):
+    def test_missing_selector_uses_capture_receipts(self):
+        got = local_validation.program_addresses()
+        self.assertEqual(got, _CAPTURED_PROGRAMS)
+        root = local_validation.ROOT
+        self.assertFalse((root / 'repro/programs.json').is_file())
+        for name, address in _CAPTURED_PROGRAMS.items():
+            receipt = json.loads((root / 'evidence/original' / name / 'capture.json').read_text())
+            self.assertEqual(receipt['program'], address)
+            idl_path = root / 'evidence/upstream' / f'{name}.json'
+            if idl_path.is_file():
+                self.assertEqual(json.loads(idl_path.read_text())['address'], address)
+            else:
+                self.assertEqual(name, 'mayhem')
+
+    def test_archived_selector_overrides_capture_receipts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / 'repro').mkdir()
+            (root / 'repro/programs.json').write_text(json.dumps({'pump': 'archived-id'}))
+            receipt = root / 'evidence/original/pump'
+            receipt.mkdir(parents=True)
+            (receipt / 'deployed.so').write_bytes(b'\x7fELF')
+            (receipt / 'capture.json').write_text(json.dumps({'program': 'capture-id'}))
+            self.assertEqual(local_validation.program_addresses(root), {'pump': 'archived-id'})
+
+    def test_capture_fallback_skips_absent_binaries_and_rejects_blank_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            pump = root / 'evidence/original/pump'
+            pump.mkdir(parents=True)
+            (pump / 'deployed.so').write_bytes(b'\x7fELF')
+            (pump / 'capture.json').write_text(json.dumps({'program': 'pump-id'}))
+            fees = root / 'evidence/original/pump_fees'
+            fees.mkdir(parents=True)
+            (fees / 'capture.json').write_text(json.dumps({'program': 'fees-without-binary'}))
+            self.assertEqual(local_validation.program_addresses(root), {'pump': 'pump-id'})
+            (pump / 'capture.json').write_text(json.dumps({'program': ''}))
+            with self.assertRaises(ValueError):
+                local_validation.program_addresses(root)
+
+    def test_no_captures_is_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(FileNotFoundError):
+                local_validation.program_addresses(tmp)
+
+    def test_archived_selector_must_be_an_object(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / 'repro').mkdir()
+            (root / 'repro/programs.json').write_text('["pump"]')
+            with self.assertRaises(ValueError):
+                local_validation.program_addresses(root)
+
+
+class DispatchRecoveryTests(unittest.TestCase):
+    def test_every_captured_program_is_recovered(self):
+        import json
+        import recover_dispatch
+        report = recover_dispatch.dispatch()
+        self.assertEqual(
+            list(report), ['pump', 'pump_amm', 'pump_fees', 'mayhem'])
+        self.assertEqual(
+            [sum(bool(row['matches']) for row in rowset['instructions'].values())
+             for rowset in report.values()],
+            [56, 38, 31, 25])
+        self.assertEqual(
+            report,
+            json.loads((analyze.ROOT / 'evidence/dispatch-map.json').read_text()))
 
 
 class SbpfInventoryInputTests(unittest.TestCase):
