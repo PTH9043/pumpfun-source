@@ -14,6 +14,7 @@ Usage:
     python3 scripts/deep_disassembly.py --program pump --output research/pump-deep-disasm-20261028
 """
 import argparse
+import bisect
 import collections
 import gzip
 import hashlib
@@ -41,38 +42,38 @@ BPF_JMP32  = 0x06
 REGS = ["r0","r1","r2","r3","r4","r5","r6","r7","r8","r9","r10"]
 
 SYSCALL_NAMES = {
-    # Solana BPF syscall hashes (murmur3 of the name)
-    0xb6fc1a11: "sol_log_",
-    0x207559bd: "sol_log_64_",
-    0x5c2a3178: "sol_log_compute_units_",
-    0x52ba5096: "sol_create_program_address",
-    0x48f18ece: "sol_try_find_program_address",
-    0x717cc4a3: "sol_sha256",
-    0x3770fb22: "sol_keccak256",
-    0xd7793abb: "sol_secp256k1_recover",
-    0xa22b9c85: "sol_memcpy_",
-    0x5fdcde31: "sol_memmove_",
-    0x73e3b3f5: "sol_memcmp_",
-    0x3b97b73c: "sol_memset_",
-    0xd56b5fe9: "sol_invoke_signed_c",
-    0xe4042040: "sol_invoke_signed_rust",
+    # SBPF hash_symbol_name: seed-zero MurmurHash3 x86_32 of symbol bytes.
+    0x207559bd: "sol_log_",
+    0x5c2a3178: "sol_log_64_",
+    0x52ba5096: "sol_log_compute_units_",
+    0x9377323c: "sol_create_program_address",
+    0x48504a38: "sol_try_find_program_address",
+    0x11f49d86: "sol_sha256",
+    0xd7793abb: "sol_keccak256",
+    0x17e40350: "sol_secp256k1_recover",
+    0x717cc4a3: "sol_memcpy_",
+    0x434371f8: "sol_memmove_",
+    0x5fdcde31: "sol_memcmp_",
+    0x3770fb22: "sol_memset_",
+    0xa22b9c85: "sol_invoke_signed_c",
+    0xd7449092: "sol_invoke_signed_rust",
     0x83f00e8f: "sol_alloc_free_",
-    0x5be92f43: "sol_set_return_data",
-    0x33ef6958: "sol_get_return_data",
-    0xe2e10497: "sol_log_data",
-    0x3b6eb49d: "sol_get_processed_sibling_instruction",
-    0x1f0c09b9: "sol_get_stack_height",
-    0xb72a0830: "sol_curve_validate_point",
-    0xdc54d79f: "sol_curve_group_op",
-    0x2ee22170: "sol_curve_multiscalar_mul",
-    0xef1d9b84: "sol_alt_bn128_group_op",
-    0x882e3b1f: "sol_big_mod_exp",
-    0xcccd2005: "sol_remaining_compute_units",
-    0x0f59f1e1: "sol_poseidon",
-    0xa93f0bfc: "sol_get_epoch_stake",
-    0xfee07a55: "sol_get_clock_sysvar",
-    0xe7ce47dc: "sol_get_rent_sysvar",
-    0x8fbcf403: "sol_get_last_restart_slot",
+    0xa226d3eb: "sol_set_return_data",
+    0x5d2245e4: "sol_get_return_data",
+    0x7317b434: "sol_log_data",
+    0xadb8efc8: "sol_get_processed_sibling_instruction",
+    0x85532d94: "sol_get_stack_height",
+    0xaa2607ca: "sol_curve_validate_point",
+    0xdd1c41a6: "sol_curve_group_op",
+    0x60a40880: "sol_curve_multiscalar_mul",
+    0xae0c318b: "sol_alt_bn128_group_op",
+    0x780e4c15: "sol_big_mod_exp",
+    0xedef5aee: "sol_remaining_compute_units",
+    0xc4947c21: "sol_poseidon",
+    0x5be92f4a: "sol_get_epoch_stake",
+    0xd56b5fe9: "sol_get_clock_sysvar",
+    0xbf7188f6: "sol_get_rent_sysvar",
+    0x188a0031: "sol_get_last_restart_slot",
 }
 
 
@@ -230,6 +231,19 @@ def extract_rodata_strings(elf):
     if len(current) >= 4:
         strings[current_start] = "".join(current)
     return strings
+
+
+def rodata_string_preview(strings, starts, address):
+    """Preview a printable-run suffix, not an inferred Rust string length."""
+    index = bisect.bisect_right(starts, address) - 1
+    if index < 0:
+        return None
+    start = starts[index]
+    text = strings[start]
+    offset = address - start
+    if offset >= len(text):
+        return None
+    return text[offset:offset + 120]
 
 
 def load_idl_discriminators(elf):
@@ -549,6 +563,7 @@ def main():
     boundaries = entries + [elf.hi]
 
     rodata_strings = extract_rodata_strings(elf)
+    rodata_starts = sorted(rodata_strings)
     print(f"[disasm] {len(rodata_strings)} rodata strings extracted")
 
     dispatch = recover_anchor_dispatch(elf)
@@ -588,10 +603,11 @@ def main():
         for insn in instructions:
             if insn.get("imm64") is not None:
                 val = insn["imm64"] & 0xFFFFFFFFFFFFFFFF
-                if val in rodata_strings:
+                preview = rodata_string_preview(rodata_strings, rodata_starts, val)
+                if preview is not None:
                     string_refs.append({
                         "offset": insn["offset"] - start,
-                        "string": rodata_strings[val][:120],
+                        "string": preview,
                     })
 
         # CFG edges
@@ -758,6 +774,10 @@ fingerprinting for cross-window pattern matching.
 {chr(10).join(f'- `{name}`: {count}' for name, count in syscall_usage.most_common(15))}
 
 ## Files
+String references preview up to 120 printable bytes from the referenced address
+to the end of its extracted ASCII run. They do not establish a Rust string's
+length, a semantic string boundary, or runtime use.
+
 | File | Description |
 |------|-------------|
 | windows-deep.json | Per-window analysis (syscalls, strings, stack, fingerprint) |

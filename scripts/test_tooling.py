@@ -1,5 +1,27 @@
 #!/usr/bin/env python3
 """Mutation tests ensuring the byte comparator cannot hide code/padding changes."""
+import hashlib
+import io
+import json
+import os
+import struct
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+
+
+import contextlib
+import io
+import json
+
+
+import os
+import struct
+import tempfile
+from pathlib import Path
+
+
 import contextlib
 import io
 import json
@@ -15,6 +37,12 @@ import shutil
 import sys
 import tempfile
 import unittest
+from amm_sell.test_cached_status import CachedAttemptStatusTests
+
+
+import gzip
+
+
 import warnings
 
 
@@ -37,6 +65,9 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
+
+
 
 
 
@@ -90,10 +121,140 @@ from unittest.mock import patch
 import deep_section_analysis
 import deep_disassembly
 import analyze
+import deep_disassembly
+import bytecode_signatures
+from compare import compare
+
+
+def symbol_hash(name):
+    """Independent seed-zero MurmurHash3 x86_32 reference for table checks.
+
+    SBPF ebpf::hash_symbol_name uses hash32::Murmur3Hasher::default().
+    Reference: aappleby/smhasher, MurmurHash3.cpp, MurmurHash3_x86_32.
+    """
+    data = name.encode('utf-8')
+    mask = 0xffffffff
+    def rotate(n, bits):
+        return ((n << bits) | (n >> (32 - bits))) & mask
+    def mix(k):
+        return (rotate((k * 0xcc9e2d51) & mask, 15) * 0x1b873593) & mask
+    h = 0
+    complete = len(data) // 4 * 4
+    for at in range(0, complete, 4):
+        h ^= mix(int.from_bytes(data[at:at+4], 'little'))
+        h = (rotate(h, 13) * 5 + 0xe6546b64) & mask
+    if complete != len(data):
+        h ^= mix(int.from_bytes(data[complete:], 'little'))
+    h ^= len(data)
+    h ^= h >> 16
+    h = h * 0x85ebca6b & mask
+    h ^= h >> 13
+    h = h * 0xc2b2ae35 & mask
+    return h ^ (h >> 16)
+
+
+class SyscallHashTests(unittest.TestCase):
+    def test_reference_vectors(self):
+        self.assertEqual(symbol_hash(''), 0)
+        self.assertEqual(symbol_hash('foo'), 0xf6a5c420)
+        self.assertEqual(symbol_hash('sol_log_'), 0x207559bd)
+
+    def test_each_table_key_is_the_hash_of_its_symbol(self):
+        for module in (deep_disassembly, bytecode_signatures, deep_section_analysis):
+            for value, name in module.SYSCALL_NAMES.items():
+                with self.subTest(module=module.__name__, symbol=name):
+                    self.assertEqual(value, symbol_hash(name))
+
+    def test_literal_calls_decode_and_fingerprint_the_hashed_name(self):
+        for name in deep_disassembly.SYSCALL_NAMES.values():
+            with self.subTest(symbol=name):
+                raw = struct.pack('<BBhI', 0x85, 0, 0, symbol_hash(name))
+                result, size = deep_disassembly.decode_instruction(raw, 0, None)
+                self.assertEqual(result['syscall'], name)
+                self.assertEqual(size, 8)
+                self.assertEqual(deep_disassembly.fingerprint_window(SimpleNamespace(b=raw, secs={}), 0, 8)['syscall_sequence'], [name])
+
+    def test_cpi_and_memcpy_selectors_use_the_same_hash_rule(self):
+        cpi = b''.join(struct.pack('<BBhI', 0x85, 0, 0, symbol_hash(name))
+                       for name in ('sol_invoke_signed_c', 'sol_invoke_signed_rust'))
+        patterns = bytecode_signatures.detect_cpi_patterns(SimpleNamespace(b=cpi), 0, len(cpi))
+        self.assertEqual([p['syscall'] for p in patterns], ['sol_invoke_signed_c', 'sol_invoke_signed_rust'])
+        memcpy = struct.pack('<BBhI', 0x85, 0, 0, symbol_hash('sol_memcpy_'))
+        self.assertEqual(bytecode_signatures.detect_serialization_patterns(SimpleNamespace(b=memcpy), 0, 8)['memcpy_calls'], 1)
+        clock = struct.pack('<BBhI', 0x85, 0, 0, symbol_hash('sol_get_clock_sysvar'))
+        self.assertEqual(bytecode_signatures.detect_cpi_patterns(SimpleNamespace(b=clock), 0, 8), [])
+        self.assertEqual(bytecode_signatures.detect_serialization_patterns(SimpleNamespace(b=cpi), 0, len(cpi))['memcpy_calls'], 0)
+
+    def test_unknown_hash_keeps_the_existing_fallback(self):
+        raw = struct.pack('<BBhI', 0x85, 0, 0, 0x12345678)
+        self.assertEqual(deep_disassembly.decode_instruction(raw, 0, None)[0]['syscall'], 'syscall_0x12345678')
+
+
 import analyze_program
 import deep_disassembly
 from window_elf_reader import Elf
 from compare import compare
+import verify_evidence
+
+
+from source_manifest_guard import strict_manifest
+
+
+class DiagnosticOutputPreservationTests(unittest.TestCase):
+    def invoke(self, source, output):
+        return subprocess.run([sys.executable, str(analyze.ROOT / 'scripts/pump_diagnostic_audit.py'),
+                               '--report', str(source), '--output', str(output)],
+                              capture_output=True, text=True)
+
+    def test_input_report_cannot_be_its_own_output(self):
+        parent = analyze.ROOT / 'work'
+        parent.mkdir(exist_ok=True)
+        for compressed in (False, True):
+            with self.subTest(compressed=compressed), tempfile.TemporaryDirectory(dir=parent) as folder:
+                source = Path(folder) / 'report.json'
+                raw = json.dumps({'suites': {}}).encode()
+                if compressed:
+                    raw = gzip.compress(raw, mtime=0)
+                source.write_bytes(raw)
+                result = self.invoke(source, source)
+                self.assertEqual(source.read_bytes(), raw)
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_prior_audit_is_preserved(self):
+        parent = analyze.ROOT / 'work'
+        parent.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=parent) as folder:
+            source, output = Path(folder) / 'report.json', Path(folder) / 'audit.json'
+            raw = b'{"suites":{}}'
+            prior = b'previous bounded audit\n'
+            source.write_bytes(raw)
+            output.write_bytes(prior)
+            result = self.invoke(source, output)
+            self.assertEqual(output.read_bytes(), prior)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(source.read_bytes(), raw)
+
+    def test_fresh_outputs_preserve_success_and_mismatch_receipts(self):
+        parent = analyze.ROOT / 'work'
+        parent.mkdir(exist_ok=True)
+        for different in (False, True):
+            with self.subTest(different=different), tempfile.TemporaryDirectory(dir=parent) as folder:
+                source, output = Path(folder) / 'report.json', Path(folder) / 'audit.json'
+                logs = ['Program log: AnchorError. Error Code: One. Error Number: 6000. Error Message: original']
+                other = [logs[0].replace('original', 'different')] if different else logs
+                raw = json.dumps({'suites': {'fixture': {'original': {'logs': logs}, 'candidate': {'logs': other}}}}).encode()
+                source.write_bytes(raw)
+                result = self.invoke(source, output)
+                self.assertEqual(result.returncode, int(different), result.stderr)
+                receipt = json.loads(output.read_bytes())
+                self.assertEqual(receipt['source_report_sha256'], hashlib.sha256(raw).hexdigest())
+                self.assertEqual(receipt['log_bearing_cases'], 1)
+                self.assertEqual(len(receipt['mismatches']), int(different))
+                self.assertEqual(source.read_bytes(), raw)
+
+
+
+
 
 
 class AnalysisInputSnapshotTests(unittest.TestCase):
@@ -571,7 +732,7 @@ class SyscallFingerprintTests(unittest.TestCase):
                   '.rel.dyn': (0, 9, 0, 0, len(code)+len(dynsym), len(rel), 0, 0, 8, 16)})
         fp = deep_disassembly.fingerprint_window(elf, 0, len(code))
         self.assertEqual(fp['syscall_sequence'],
-                         ['sol_log_64_', 'abort', 'unknown_0x12345678', 'abort'])
+                         ['sol_log_', 'abort', 'unknown_0x12345678', 'abort'])
         self.assertEqual(fp['opcode_count'], 7)
 
     def test_missing_invalid_and_noncall_relocations(self):
@@ -596,7 +757,7 @@ class SyscallFingerprintTests(unittest.TestCase):
                 elf = SimpleNamespace(b=code, secs=sections, symbols={},
                                       relocations={0: {'type': 10, 'symbol': 'unresolved'}})
                 self.assertEqual(deep_disassembly.fingerprint_window(
-                    elf, 0, len(code))['syscall_sequence'], ['sol_log_64_'])
+                    elf, 0, len(code))['syscall_sequence'], ['sol_log_'])
 
     def test_captured_import_sequences(self):
         for name, count in (('pump', 269), ('pump_amm', 173),
@@ -649,7 +810,7 @@ class InternalCallDecodeTests(unittest.TestCase):
         blob = struct.pack('<BBhI', 0x85, 0, 0, 0x207559bd)
         elf = SimpleNamespace(funcs=[], relocations={})
         record, _ = deep_disassembly.decode_instruction(blob, 0, elf)
-        self.assertEqual(record['syscall'], 'sol_log_64_')
+        self.assertEqual(record['syscall'], 'sol_log_')
         self.assertNotIn('call_target', record)
 
     def test_captured_call_targets_match_window_reader(self):
@@ -939,6 +1100,149 @@ class InstructionLogNameTests(unittest.TestCase):
         self.assertIn('InitializeGlobalParams', names)
 
 
+@unittest.skipUnless(sys.version_info >= (3, 11), 'pump_dependency_cache needs tomllib')
+class DependencyCacheArchiveTests(unittest.TestCase):
+    def import_seed(self, extra=None):
+        import pump_dependency_cache as m
+        sha = lambda p: hashlib.sha256(Path(p).read_bytes()).hexdigest()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            crate = root / 'repo/prog'
+            crate.mkdir(parents=True)
+            (crate / 'Cargo.toml').write_text('[package]\nname="prog"\nversion="0.1.0"\n[workspace]\n')
+            files = {'Cargo.toml': b'[package]\nname="dep"\nversion="1.0.0"\n', 'src/lib.rs': b'pub fn f() {}\n'}
+            data = io.BytesIO()
+            with tarfile.open(fileobj=data, mode='w:gz') as tar:
+                for name, body in files.items():
+                    info = tarfile.TarInfo('dep-1.0.0/' + name)
+                    info.size = len(body)
+                    tar.addfile(info, io.BytesIO(body))
+            home = root / 'cargo'
+            namespace = 'index.crates.io-1949cf8c6b5b557f'
+            archive = home / 'registry/cache' / namespace / 'dep-1.0.0.crate'
+            archive.parent.mkdir(parents=True)
+            archive.write_bytes(data.getvalue())
+            (crate / 'Cargo.lock').write_text(
+                'version = 3\n[[package]]\nname="dep"\nversion="1.0.0"\nchecksum="%s"\n'
+                '[[package]]\nname="prog"\nversion="0.1.0"\n' % sha(archive))
+            source = home / 'registry/src' / namespace / 'dep-1.0.0'
+            for name, body in {**files, '.cargo-ok': b'{"v":1}', **({extra: b'fn main() {}\n'} if extra and extra != 'linked' else {})}.items():
+                (source / name).parent.mkdir(parents=True, exist_ok=True)
+                (source / name).write_bytes(body)
+            if extra == 'linked':
+                os.symlink(source / 'src', source / 'linked')
+            build = root / 'build'
+            (build / 'target/release/deps').mkdir(parents=True)
+            (build / 'target/release/deps/libdep-0123456789abcdef.rlib').write_bytes(b'rlib')
+            for name in ['candidate.so', 'unstripped.so']:
+                (build / name).write_bytes(name.encode())
+            wrapper = root / 'wrapper'
+            wrapper.write_text('w')
+            (build / 'build-comparison.json').write_text(json.dumps({
+                'returncode': 0, 'source_unchanged': True, 'source_sha256': {},
+                'comparison': {'candidate_sha256': sha(build / 'candidate.so')},
+                'unstripped_sha256': sha(build / 'unstripped.so'),
+                'tool_sha256': {'rustc': 'r', 'cargo': 'c'}, 'source_wrapper_sha256': sha(wrapper),
+                'environment': {'CARGO_HOME': str(home)},
+                'command': ['cargo', '--manifest-path', str(crate / 'Cargo.toml')]}))
+            cache = object.__new__(m.DependencyCache)
+            cache.repo, cache.crate, cache.workspace, cache.direct = root / 'repo', crate, crate, False
+            cache.env = {'CARGO_HOME': str(home)}
+            cache.target = 'sbf-solana-solana'
+            cache.target_flags_key = 'CARGO_TARGET_SBF_SOLANA_SOLANA_RUSTFLAGS'
+            cache.tools = {'rust/bin/rustc': 'r', 'rust/bin/cargo': 'c'}
+            cache.sources = {str(source): m.tree(source)}
+            cache.packages = cache.crates = {'dep'}
+            cache.main_names = {'prog'}
+            cache.context = {'wrapper_sha256': sha(wrapper), 'external_sources': cache.sources}
+            cache.root, cache.key, cache.record = root / 'cache', 'k', {}
+            cache.entry = cache.root / 'k'
+            try:
+                cache.import_clean_build(build)
+            finally:
+                published = cache.entry.exists()
+            return cache.record, published
+
+    def test_locked_source_tree_is_imported(self):
+        record, published = self.import_seed()
+        self.assertEqual(record['imported_clean_build']['archive_files_verified'], 2)
+        self.assertTrue(published)
+
+    def test_files_absent_from_locked_archive_are_rejected(self):
+        for extra in ['build.rs', 'src/evil.rs', 'linked']:
+            with self.subTest(extra=extra), self.assertRaisesRegex(AssertionError, 'absent from locked archive'):
+                self.import_seed(extra)
+
+
+class ProgramDataPdaTests(unittest.TestCase):
+    def record(self, name):
+        return json.loads((analyze.ROOT / 'evidence' / name / 'capture.json').read_text())
+
+    def test_upgradeable_captures_bind_to_loader_pda(self):
+        for f in sorted((analyze.ROOT / 'evidence').glob('**/capture.json')):
+            m = json.loads(f.read_text())
+            if m.get('loader') != 'legacy-v2':
+                verify_evidence.check_programdata_pda(m)
+
+    def test_other_programs_bytes_under_this_program_id_are_rejected(self):
+        m = self.record('original/pump')
+        m['programdata'] = self.record('original/pump_amm')['programdata']
+        with self.assertRaises(AssertionError):
+            verify_evidence.check_programdata_pda(m)
+
+    def test_gate_checks_every_upgradeable_capture(self):
+        seen = []
+        check = verify_evidence.check_programdata_pda
+        verify_evidence.check_programdata_pda = lambda m: (seen.append(m['program']), check(m))
+        self.addCleanup(setattr, verify_evidence, 'check_programdata_pda', check)
+        with contextlib.redirect_stdout(io.StringIO()):
+            verify_evidence.main()
+        self.assertEqual(len(seen), 8)
+
+
+class SourceManifestLinkedDirectoryTests(unittest.TestCase):
+    def crate(self, root):
+        root = root.resolve()
+        crate = root / 'repo/crate'
+        crate.mkdir(parents=True)
+        (crate / 'Cargo.toml').write_text('[package]\nname = "probe"\n')
+        outside = root / 'outside'
+        outside.mkdir()
+        (outside / 'lib.rs').write_text('pub fn external() {}\n')
+        return crate, outside
+
+    def test_plain_source_directory_is_accepted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            crate, _ = self.crate(Path(temporary))
+            (crate / 'src').mkdir()
+            (crate / 'src/lib.rs').write_text('pub fn local() {}\n')
+            self.assertEqual(set(strict_manifest(crate, crate, crate.parent)), {'crate/Cargo.toml', 'crate/src/lib.rs'})
+
+    def test_symlinked_source_directory_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            crate, outside = self.crate(Path(temporary))
+            os.symlink(outside, crate / 'src')
+            with self.assertRaisesRegex(ValueError, 'symlinked directory'):
+                strict_manifest(crate, crate, crate.parent)
+
+    def test_symlinked_directory_named_target_below_the_crate_root_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            crate, outside = self.crate(Path(temporary))
+            (crate / 'src').mkdir()
+            os.symlink(outside, crate / 'src/target')
+            with self.assertRaisesRegex(ValueError, 'symlinked directory'):
+                strict_manifest(crate, crate, crate.parent)
+
+    def test_symlinked_directory_in_extra_input_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            crate, outside = self.crate(Path(temporary))
+            assets = crate.parent / 'assets'
+            assets.mkdir()
+            os.symlink(outside, assets / 'tables')
+            with self.assertRaisesRegex(ValueError, 'symlinked directory'):
+                strict_manifest(crate, crate, crate.parent, [assets])
+
+
 class RelocatedCallTargetTests(unittest.TestCase):
     """Call targets live in .rel.dyn, so detectors cannot read the immediate."""
 
@@ -1207,7 +1511,9 @@ class WindowScorerBaselineTests(unittest.TestCase):
     def test_default_baseline_reports_a_lost_window(self):
         scorer = load_window_scorer()
         # Window 0x120 is a normalized match in the committed baseline.
-        lost = {0x120: {'normalized': False, 'raw': False, 'symbols': [], 'bytes': 176}}
+        baseline = scorer.load_baseline(scorer.SC / 'pump-main/baseline/score.json')
+        lost = {address: dict(window) for address, window in baseline.items()}
+        lost[0x120] = {'normalized': False, 'raw': False, 'symbols': [], 'bytes': 176}
         with patch.object(scorer, 'score_with_hash', return_value=(lost, 'mock-sha256')), \
                 patch.object(pathlib.Path, 'read_bytes', return_value=b''):
             summary = self.run_main(scorer)
