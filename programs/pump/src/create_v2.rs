@@ -222,15 +222,15 @@ fn validate_quote_mint<'info>(ctx:&Context<'_,'_,'_,'info,CreateV2<'info>>,remai
   (QuoteSource::Whitelisted,None)
  } else {
   let control=nested_create::quote_control(remaining_accounts.get(3))?;
-  match nested_create::control_account(control,mint_key)? {
-   Some(reserves)=>(QuoteSource::Controlled,Some(reserves)),
-   None=>{
+  match nested_create::control_account(control,mint_key) {
+   Ok(Some(reserves))=>(QuoteSource::Controlled,Some(reserves)),
+   Ok(None)=>{
     let (reserves,depth)=nested_create::walk(remaining_accounts,&a.global)?;
     (QuoteSource::Nested(depth),Some(reserves))
    }
+   Err(e)=>return Err(e),
   }
  };
-
 
 
 
@@ -781,7 +781,7 @@ pub fn execute<'info>(ctx:Context<'_,'_,'_,'info,CreateV2<'info>>,name:String,sy
 
 
 
- let depth=if let QuoteSource::Nested(depth)=source {depth} else {0};
+ let depth=match source {QuoteSource::Sol|QuoteSource::Whitelisted|QuoteSource::Controlled=>0,QuoteSource::Nested(depth)=>depth};
  ctx.accounts.init_curve(creator,quote_mint,reserves,depth,fee,is_mayhem_mode,is_holder_reward.0);
 
 
