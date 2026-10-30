@@ -134,6 +134,7 @@ import struct
 import sys
 import unittest
 from test_analysis_interface_inventory import InterfaceInventoryEncodingTests
+from test_fees_external_codec_cases import ExternalCodecBooleanCases
 from types import SimpleNamespace
 import deep_disassembly
 from pathlib import Path
@@ -945,6 +946,7 @@ class RevalidationReportTests(unittest.TestCase):
 
 
 from test_pump_diagnostic_audit import DiagnosticMetadataTests
+from test_build_quote_fees import QuoteFeesBuildLogTests
 class ComparisonTests(unittest.TestCase):
     def test_equal(self): self.assertTrue(compare(b'abc\0\0',b'abc\0\0')['full_byte_equality'])
     def test_code_mutation(self): self.assertEqual(compare(b'abc\0\0',b'axc\0\0')['first_difference'],1)

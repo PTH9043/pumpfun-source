@@ -45,6 +45,11 @@ def load_report(path):
         if type(normalized) is not bool or type(raw) is not bool or (raw and not normalized):
             raise ValueError(f'window {key} has inconsistent match flags')
         result[start] = {'bytes': size, 'normalized': normalized, 'raw': raw}
+    previous_end = -1
+    for start in sorted(result):
+        if start < previous_end:
+            raise ValueError(f'overlapping window range: {start}')
+        previous_end = start + result[start]['bytes']
     return result
 
 
