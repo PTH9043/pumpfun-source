@@ -193,10 +193,10 @@ pub enum QuoteSource { Sol, Whitelisted, Controlled, Nested(u8) }
 
 
 
-fn validate_quote_mint<'info>(ctx:&Context<'_,'_,'_,'info,CreateV2<'info>>,remaining_accounts:&[AccountInfo<'info>])->Result<(Pubkey,Option<u64>,QuoteSource)>{
+fn validate_quote_mint<'info>(accounts:&CreateV2<'info>,remaining_accounts:&[AccountInfo<'info>])->Result<(Pubkey,Option<u64>,QuoteSource)>{
  if remaining_accounts.is_empty() {return Ok((Pubkey::default(),None,QuoteSource::Sol));}
  require_gte!(remaining_accounts.len(),3,PumpError::NotEnoughRemainingAccounts);
- let a=&ctx.accounts;
+ let a=accounts;
  let mint=&remaining_accounts[0];
  let ata=&remaining_accounts[1];
  let program=&remaining_accounts[2];
@@ -736,7 +736,7 @@ pub fn execute<'info>(ctx:Context<'_,'_,'_,'info,CreateV2<'info>>,name:String,sy
 
 
  require_eq!(a.global.create_v2_enabled,true,PumpError::CreateV2Disabled);
- let (quote_mint,reserves,source)=validate_quote_mint(&ctx,ctx.remaining_accounts)?;
+ let (quote_mint,reserves,source)=validate_quote_mint(ctx.accounts,ctx.remaining_accounts)?;
 
 
 

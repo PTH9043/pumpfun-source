@@ -16,9 +16,10 @@ is rebased on that main and only adds the two edits below.
 | g7 (= main after #2154) | 15,544 | 0.82553 | 1027 / 276 | |
 | d1 = g7 + exhaustive depth match | 15,560 | 0.82400 | 1027 / 276 | orig `jlt tag,3` form, RA worse |
 | c1b = d1 + explicit `Result` match on `control_account` | 15,592 | 0.84194 | 1027 / 276, 0 losses | is_holder_reward=r6, ctx=r7 as orig |
-| **t6 = c1b + depth computed inside `init_curve` from `source`** | **15,592** | **0.84516** | **1027 / 276, 0 losses** | on main f101886 |
+| t6 = c1b + depth computed inside `init_curve` from `source` | 15,592 | 0.84516 | 1027 / 276, 0 losses | on main f101886 |
+| **p1 = t6 + `validate_quote_mint(accounts:&CreateV2, ..)`** | **15,576 (= orig)** | **0.85100** | **1027 / 276, 0 losses** | slots_diff 1489 |
 
-unstripped sha256 (t6, rebased on main f101886) `f81143e02e0f6da3f2853b53f8af1e46411e6ccf572e6af5b402c0a4088b8ae2`.
+unstripped sha256 (p1, main f101886) `a12ccddaa866c017bd7f3e282c0badf5c639109c3f5614d97fc8f1176035ac6e`.
 
 ## Mechanisms
 
@@ -46,6 +47,13 @@ unstripped sha256 (t6, rebased on main f101886) `f81143e02e0f6da3f2853b53f8af1e4
    same exhaustive match there (at the top or at the store: byte-identical) shortens the depth live
    range across the vqr diamond; the select is now formed next to its store and kept in a register
    (`jlt tag,3; mov r5,r0; ... stxb [curve+0xa0],r5`): 0.84194 -> 0.84516.
+
+4. **Validate takes `&CreateV2` (p1).** With `validate_quote_mint(ctx:&Context, ..)` the accounts
+   struct is reached through `ctx.accounts`, which carries no noalias/readonly guarantee, so every
+   `a.global` after an opaque call (quote_control, control_account) is a fresh load of
+   `accounts+0xf8`. Passing `ctx.accounts` as a `&CreateV2` parameter makes it noalias readonly after
+   LLVM inlining; GVN reuses execute's global pointer and `walk` gets it from the spill slot
+   (`ldxdw r4,[r10-0x728]; add64 r4,8`) as in the original. Size is now exactly the original 15,576 B.
 
 All edits are behaviour-preserving (`?` on `anchor_lang::Result` is `From::from` identity; the depth
 match is exhaustive over the same variants).
